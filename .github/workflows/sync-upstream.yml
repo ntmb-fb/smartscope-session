@@ -52,6 +52,7 @@ jobs:
         if: steps.merge.outputs.count != '0' && steps.merge.outputs.conflict == 'false'
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}   # in a fork, gh would otherwise target upstream
         run: |
           branch="${{ steps.merge.outputs.branch }}"
           gh pr list --head "$branch" --json number --jq '.[0].number' | grep -q . && exit 0
@@ -66,6 +67,7 @@ jobs:
         if: steps.merge.outputs.conflict == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}   # in a fork, gh would otherwise target upstream
         run: |
           title="Upstream sync needs a manual merge"
           gh issue list --state open --search "$title in:title" --json number --jq '.[0].number' | grep -q . && exit 0
