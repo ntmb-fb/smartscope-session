@@ -48,7 +48,7 @@ from dwarf_python_api.lib.dwarf_utils import (
     start_polar_align,
 )
 
-from components import connection_health
+from components import connection_health, scheduler_runner
 from components.i18n import t
 
 # In-memory only - no field in get_client_status()'s fullStatus reports
@@ -79,14 +79,10 @@ def _build_eq_result_panel(session) -> Callable[[], None]:
     the azimuth/altitude knob to CORRECT the error, not which way the
     error itself points.
 
-    PER-MODEL (Sep 2026, field-tested): the sign convention is NOT the
-    same between Mini and Dwarf 3 - a real Mini test showed the
-    ORIGINAL (un-flipped) mapping already correct (turning the knob the
-    way that icon pointed reduced the error), while a real Dwarf 3 test
-    showed the OPPOSITE - the flipped mapping was needed there. Dwarf II
-    user-confirmed (Sep 2026) to share the same mechanism as D3, so it
-    gets the same flipped mapping - not independently tested on a real
-    D2 unit, but a direct statement about the hardware, not a guess.
+    Same sign convention on every model (user-reported Oct 2026: the
+    Sep 2026 per-model flip for Dwarf 3 / Dwarf II made the D3 indicator
+    point the wrong way - the Mini's mapping, already right, is right on
+    the D3 too, so D2, D3 and Mini share it).
     Absolute value still shown (sign is conveyed by the icon/colour, not
     by a +/- prefix), matching Dwarfium's own Math.abs(...).toFixed(2).
 
@@ -114,16 +110,7 @@ def _build_eq_result_panel(session) -> Callable[[], None]:
             return
         panel.set_visibility(True)
 
-        # See this function's own docstring - D3 needs the flipped
-        # (correction-direction) mapping; Mini (and, unconfirmed, D2)
-        # use the original error-direction mapping as-is.
-        # See this function's own docstring - D2 and D3 share the same
-        # mechanism (user-confirmed Sep 2026) and both need the flipped
-        # (correction-direction) mapping; Mini uses the original error-
-        # direction mapping as-is.
-        needs_flip = config_to_dwarf_id_int(session.config.dwarf_model_id) in (2, 3)
-
-        if (azi_err > 0) != needs_flip:
+        if azi_err > 0:
             azi_icon.name = "rotate_right"
             azi_icon.classes(replace="text-lg text-positive")
         else:
@@ -131,7 +118,7 @@ def _build_eq_result_panel(session) -> Callable[[], None]:
             azi_icon.classes(replace="text-lg text-negative")
         azi_label.set_text(f"{abs(azi_err):.2f}\u00b0 {t('action_eq_solving_azimuth')}")
 
-        if (alt_err > 0) != needs_flip:
+        if alt_err > 0:
             alt_icon.name = "arrow_upward"
             alt_icon.classes(replace="text-lg text-positive")
         else:
@@ -246,25 +233,32 @@ def _polar_position_sequence(session) -> bool:
         return bool(motor_action(3, session=session))  # Pitch positioning
 
 
+async def _send_light(session, dwarf_uid, fn):
+    """Sends one light command: with the command slot, taking priority
+    over the periodic connection check, or without it while a program
+    captures (scheduler_runner.program_capturing() - user-requested Oct
+    2026: the lights stayed "device busy" for the whole program). None
+    when the device is busy (notified), else the command's result."""
+    acquired = connection_health.acquire_with_priority(dwarf_uid, caller="actions.lights")
+    if not acquired and not scheduler_runner.program_capturing(session):
+        ui.notify(t("device_busy"), type="warning")
+        return None
+    try:
+        return await run.io_bound(fn, session=session)
+    finally:
+        if acquired:
+            connection_health.release_command_slot(dwarf_uid)
+
+
 async def _handle_toggle_lights(session, dwarf_uid) -> None:
     is_on = _lights_on.get(dwarf_uid, False)
     fn = perform_powerCloseRGB if is_on else perform_powerOpenRGB
 
-    # Same priority-over-health_check reasoning as _run_and_notify()
-    # above - see that function's own comment.
-    connection_health.mark_priority_pending(dwarf_uid)
-    try:
-        acquired = connection_health.try_acquire_command_slot(dwarf_uid)
-    finally:
-        connection_health.clear_priority_pending(dwarf_uid)
-    if not acquired:
-        ui.notify(t("device_busy"), type="warning")
+    # Also during a program's capture, without the slot (user-requested
+    # Oct 2026) - see _send_light().
+    result = await _send_light(session, dwarf_uid, fn)
+    if result is None:
         return
-    try:
-        result = await run.io_bound(fn, session=session)
-    finally:
-        connection_health.release_command_slot(dwarf_uid)
-
     # is not False, not a plain truthy check - perform_powerOpenRGB/
     # perform_powerCloseRGB return the raw response value (>= 0) on
     # success via get_result_value(), and 0 is a valid success value
@@ -280,21 +274,11 @@ async def _handle_toggle_power_lights(session, dwarf_uid) -> None:
     is_on = _power_lights_on.get(dwarf_uid, False)
     fn = perform_powerIndOff if is_on else perform_powerIndOn
 
-    # Same priority-over-health_check reasoning as _run_and_notify()
-    # above - see that function's own comment.
-    connection_health.mark_priority_pending(dwarf_uid)
-    try:
-        acquired = connection_health.try_acquire_command_slot(dwarf_uid)
-    finally:
-        connection_health.clear_priority_pending(dwarf_uid)
-    if not acquired:
-        ui.notify(t("device_busy"), type="warning")
+    # Also during a program's capture, without the slot (user-requested
+    # Oct 2026) - see _send_light().
+    result = await _send_light(session, dwarf_uid, fn)
+    if result is None:
         return
-    try:
-        result = await run.io_bound(fn, session=session)
-    finally:
-        connection_health.release_command_slot(dwarf_uid)
-
     if result is not False:
         _power_lights_on[dwarf_uid] = not is_on
         ui.notify(
