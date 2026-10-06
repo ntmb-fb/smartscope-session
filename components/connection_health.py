@@ -108,6 +108,8 @@ from __future__ import annotations
 
 import asyncio
 import time
+
+from components import device_lock, device_prefs
 import dwarf_python_api.lib.my_logger as log
 
 from nicegui import background_tasks, run
@@ -118,7 +120,10 @@ from dwarf_python_api.lib.dwarf_utils import (
     perform_disconnect,
     perform_enter_astro_mode,
     perform_get_device_state_info,
-    perform_read_astro_stacking_status_v3
+    perform_read_astro_stacking_status_v3,
+    perform_set_location,
+    perform_time,
+    perform_timezone,
 )
 
 # How often to actively probe a session that LOOKS connected (seconds).
@@ -191,12 +196,58 @@ _priority_pending: set[str] = set()
 
 _manual_disconnect: set[str] = set()
 
+# Taken over (user-reported Oct 2026, Dwarf Mini): a Dwarf that drops the
+# connection _QUICK_DROP_S after each (re)connection is being used by
+# another client - the Mini accepts only one connection, whatever the
+# client_id (an older Astro Dwarf Session, another PC, the official app).
+# Auto-reconnecting would just take it back from that client, which then
+# takes it back in turn. After _MAX_QUICK_DROPS such drops in a row, auto-
+# reconnect stops until the user connects again themselves.
+_QUICK_DROP_S = 60.0
+_MAX_QUICK_DROPS = 3
+_connected_at: dict[str, float] = {}
+_quick_drops: dict[str, int] = {}
+_taken_over: set[str] = set()
+
+
+def _note_drop(dwarf_uid: str) -> None:
+    """Records a lost connection (once per connection): a drop within
+    _QUICK_DROP_S of connecting counts towards the taken-over state."""
+    started = _connected_at.pop(dwarf_uid, None)
+    if started is None:
+        return
+    if time.monotonic() - started < _QUICK_DROP_S:
+        _quick_drops[dwarf_uid] = _quick_drops.get(dwarf_uid, 0) + 1
+        if _quick_drops[dwarf_uid] >= _MAX_QUICK_DROPS:
+            _taken_over.add(dwarf_uid)
+            log.warning(
+                f"[{dwarf_uid}] Connection dropped {_quick_drops[dwarf_uid]} times right after connecting - "
+                "another client is using this Dwarf, auto-reconnect stopped."
+            )
+    else:
+        _quick_drops.pop(dwarf_uid, None)
+
+
+def is_taken_over(dwarf_uid: str) -> bool:
+    """True when auto-reconnect stopped because another client keeps
+    taking this Dwarf (see _note_drop())."""
+    return dwarf_uid in _taken_over
+
+
+def clear_taken_over(dwarf_uid: str) -> None:
+    """Call on a manual connect: the user decides to take the Dwarf back."""
+    _taken_over.discard(dwarf_uid)
+    _quick_drops.pop(dwarf_uid, None)
+
+
 def mark_manual_disconnect(dwarf_uid: str) -> None:
     """Called by the UI's own Disconnect action - suppresses auto_
     reconnect() for this device until the user reconnects it themselves
     (mark_just_connected() or an explicit new connect action clears
     this)."""
     _manual_disconnect.add(dwarf_uid)
+    # Not a drop: doesn't count towards the taken-over state
+    _connected_at.pop(dwarf_uid, None)
 
 
 def clear_manual_disconnect(dwarf_uid: str) -> None:
@@ -244,6 +295,17 @@ def try_acquire_command_slot(dwarf_uid: str, caller: str = "?") -> bool:
     _command_in_flight_caller[dwarf_uid] = caller
     log.debug(f"[{dwarf_uid}] slot acquired by {caller!r}.")
     return True
+
+
+def acquire_with_priority(dwarf_uid: str, caller: str = "?") -> bool:
+    """try_acquire_command_slot() for a user action: marked priority
+    pending around the attempt (see mark_priority_pending()), so it wins
+    the race against this module's own periodic check."""
+    mark_priority_pending(dwarf_uid)
+    try:
+        return try_acquire_command_slot(dwarf_uid, caller=caller)
+    finally:
+        clear_priority_pending(dwarf_uid)
 
 
 def release_command_slot(dwarf_uid: str) -> None:
@@ -301,8 +363,39 @@ async def connect_and_enter_astro_mode(session) -> bool:
     actually asked for - so a separate perform_get_device_state_info()
     call first would just send that same command twice on every fresh
     connect."""
+    if not device_lock.claim(session.dwarf_uid):
+        # Another Astro Dwarf Session instance on this PC uses this Dwarf
+        return False
     result = await run.io_bound(perform_enter_astro_mode, session=session)
-    return result is not False
+    if result is False:
+        return False
+    await sync_device_clock(session)
+    return True
+
+
+async def sync_device_clock(session) -> None:
+    """Pushes this PC's time, the configured timezone and the site location
+    to the Dwarf, as the official app does on every connection (SET_TIME /
+    SET_TIME_ZONE / SET_LOCATION, 13000/13001/13010 in every capture).
+    Called by connect_and_enter_astro_mode() (manual connect); the caller
+    holds the command slot. _auto_reconnect() (startup auto-connection and
+    reconnects) sends the same three commands itself, SET_TIME first since
+    it is what opens the connection there.
+
+    The native shooting schedule runs on the DEVICE clock: until now only
+    dwarf_session.py set it, so a Dwarf connected through this UI alone
+    could keep a wrong clock and reject valid windows (Oct 2026: two -16301
+    INVALID_SHOOTING_DURATION fitting a clock ~2 h ahead). Best effort: a
+    failure is logged, the connection itself is not failed."""
+    for label, func in (("time", perform_time), ("timezone", perform_timezone),
+                        ("location", perform_set_location)):
+        try:
+            ok = await run.io_bound(func, session=session)
+        except Exception as e:  # never break a connect over this
+            ok = False
+            log.warning(f"[{session.dwarf_uid}] Device {label} sync failed: {e}")
+        if ok is False:
+            log.warning(f"[{session.dwarf_uid}] Device {label} not synced.")
 
 
 async def _auto_reconnect(session: DwarfSession) -> None:
@@ -310,12 +403,17 @@ async def _auto_reconnect(session: DwarfSession) -> None:
     awaited by the poll loop, since a reconnect sequence can itself
     take a while per attempt.
 
-    Deliberately light: perform_get_device_state_info() only, NOT
-    connect_and_enter_astro_mode() - see the module docstring's AUTO-
+    Deliberately light: time / timezone / location only (no mode switch),
+    NOT connect_and_enter_astro_mode() - see the module docstring's AUTO-
     RECONNECT section for why forcing a fresh mode switch on every
     unattended retry is the wrong default."""
     uid = session.dwarf_uid
     if uid in _auto_reconnect_in_progress:
+        return
+    if not device_lock.claim(uid):
+        # Used by another instance on this PC: connecting would drop it
+        # (same client_id). Not counted as a failed attempt - retried on
+        # the next poll tick, so this instance takes over once it's free.
         return
     _auto_reconnect_in_progress.add(uid)
     try:
@@ -324,9 +422,23 @@ async def _auto_reconnect(session: DwarfSession) -> None:
                 return
             try:
                 await run.io_bound(perform_disconnect, session=session)
-                result = await run.io_bound(perform_get_device_state_info, session=session)
+                # The reconnect is opened by SET_TIME itself (user-tested,
+                # Oct 2026: ~5 s instead of ~11 s). Opening the socket
+                # already sends GET_DEVICE_STATE_INFO (send_message_init),
+                # so the former explicit perform_get_device_state_info()
+                # only asked the same thing twice. This also covers the
+                # automatic connection at app startup: the device clock is
+                # set like the official app does on every connection.
+                result = await run.io_bound(perform_time, session=session)
                 success = result is not False
                 if success:
+                    # Best effort, never the success criterion: both return
+                    # False (without sending) when the timezone / location
+                    # is not configured, which must not count as a failed
+                    # reconnect.
+                    for label, func in (("timezone", perform_timezone), ("location", perform_set_location)):
+                        if await run.io_bound(func, session=session) is False:
+                            log.warning(f"[{uid}] Device {label} not synced.")
                     # Reconciliation runs here, still holding the slot -
                     # see reconcile_after_reconnect()'s own docstring
                     # (user-reported Sep 2026: a force-stopped run's
@@ -400,8 +512,12 @@ async def maybe_check(session: DwarfSession) -> None:
         await _cleanup_stale_event_loop(session)
         forget(session.dwarf_uid)
         uid = session.dwarf_uid
+        _note_drop(uid)
         if (
             uid not in _manual_disconnect
+            and uid not in _taken_over
+            # Hidden on the dashboard: not used for now, no auto-connect
+            and not device_prefs.is_hidden(uid)
             and uid not in _auto_reconnect_exhausted
             and uid not in _auto_reconnect_in_progress
         ):
@@ -414,7 +530,18 @@ async def maybe_check(session: DwarfSession) -> None:
     now = time.monotonic()
     if now - _last_check_at.get(uid, 0.0) < _CHECK_INTERVAL_S:
         return
+    from components import scheduler_runner  # local import - imports this module
+
+    if scheduler_runner.is_running(uid):
+        # A program (or a run resumed after a restart) holds the slot for
+        # its whole duration and follows the device itself: no check to
+        # send (user-reported Oct 2026: a resumed run logged a "slot busy"
+        # denial for the health check every second, all night).
+        return
     if not try_acquire_command_slot(uid, caller="health_check"):
+        # Busy with a one-off command: next try after the normal interval,
+        # not on every poll tick of every open page.
+        _last_check_at[uid] = now
         return
 
     _check_started_at[uid] = time.monotonic()
@@ -427,7 +554,17 @@ async def maybe_check(session: DwarfSession) -> None:
         release_command_slot(uid)
         _check_started_at.pop(uid, None)
 
-    if not ok and uid not in _auto_reconnect_exhausted and uid not in _auto_reconnect_in_progress:
+    if not ok:
+        _note_drop(uid)
+    elif uid in _connected_at and time.monotonic() - _connected_at[uid] >= _QUICK_DROP_S:
+        # Held long enough: earlier quick drops were not a takeover
+        _quick_drops.pop(uid, None)
+    if (
+        not ok
+        and uid not in _auto_reconnect_exhausted
+        and uid not in _auto_reconnect_in_progress
+        and uid not in _taken_over
+    ):
         background_tasks.create(_auto_reconnect(session), name=f"auto-reconnect-{uid}")
 
 
@@ -449,4 +586,5 @@ def mark_just_connected(dwarf_uid: str) -> None:
     next time it drops."""
     _last_check_ok.pop(dwarf_uid, None)
     _last_check_at[dwarf_uid] = time.monotonic()
+    _connected_at[dwarf_uid] = time.monotonic()
     _auto_reconnect_exhausted.discard(dwarf_uid)
