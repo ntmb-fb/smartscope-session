@@ -55,7 +55,9 @@ jobs:
         run: |
           branch="${{ steps.merge.outputs.branch }}"
           gh pr list --head "$branch" --json number --jq '.[0].number' | grep -q . && exit 0
-          git push origin "$branch"
+          # The branch is this workflow's own and is rebuilt on every run: a copy
+          # left by an earlier failed run would otherwise reject the push.
+          git push --force origin "$branch"
           gh pr create --base smartscope --head "$branch" \
             --title "Sync upstream (${{ steps.merge.outputs.count }} commits)" \
             --body "Automatic merge of stevejcl/astro_dwarf_session@NiceGui_V3_multi. Tests passed."
