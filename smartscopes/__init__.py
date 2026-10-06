@@ -22,6 +22,9 @@ def install() -> None:
     from smartscopes import branding
 
     branding.apply()  # "Smartscope Session" everywhere, without editing upstream files
+    from smartscopes.ui import touch
+
+    touch.apply()     # finger-sized buttons on phones, likewise
     import smartscopes.drivers  # noqa: F401  (registers every driver)
     from smartscopes.manager import get_scope_manager, scheduler_tick
     from smartscopes.ui.pages import build_pages
