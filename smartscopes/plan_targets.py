@@ -9,6 +9,7 @@ upstream's own, hardware-tested runner.
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import threading
@@ -16,6 +17,8 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from smartscopes import tonightplan as tp
+
+log = logging.getLogger("smartscopes")
 
 _PREFS_PATH = os.path.abspath(os.path.join("Devices_Sessions", "smartscopes_prefs.json"))
 _prefs_lock = threading.Lock()
@@ -93,7 +96,8 @@ def _mosaic_framing(c: tp.Candidate, fov: tuple[float, float]) -> tuple[int, int
 
 class PlanTarget:
     uid: str
-    scope_name: str
+    scope_name: str              # the model ("Dwarf 3")
+    label: str                   # this telescope, where several are listed together
     fov: tuple[float, float] | None
     exposures: list[str]
     default_exposure: str
@@ -146,6 +150,7 @@ class DriverPlanTarget(PlanTarget):
         model = device.driver.model
         self.uid = device.uid
         self.scope_name = model.display_name
+        self.label = device.entry.name or model.display_name
         self.fov = model.fov_arcmin
         self.exposures = [f"{e:g}" for e in model.exposures_s] or ["10"]
         self.default_exposure = self.exposures[0]
@@ -191,7 +196,7 @@ class DwarfPlanTarget(PlanTarget):
         self.session = session
         self.uid = session.dwarf_uid
         self.dwarf_type = config_to_dwarf_id_str(session.config.dwarf_model_id) or "2"
-        self.scope_name = _DWARF_NAME.get(self.dwarf_type, "Dwarf")
+        self.scope_name = self.label = _DWARF_NAME.get(self.dwarf_type, "Dwarf")
         self.fov = _DWARF_FOV.get(self.dwarf_type)
         # Deep-sky subs only (>= 5 s) from the model's own exposure table.
         names = _exposure_names("tele", self.dwarf_type)
@@ -266,6 +271,26 @@ class DwarfPlanTarget(PlanTarget):
                 json.dump(program, f, indent=4)
             paths.append(path)
         return paths
+
+
+def all_plan_targets() -> list[PlanTarget]:
+    """Every telescope the app knows, Dwarfs first (as on the dashboard)."""
+    targets: list[PlanTarget] = []
+    try:
+        from dwarf_python_api.lib.dwarf_session import get_manager
+
+        sessions = get_manager().all()
+    except Exception:
+        sessions = []
+    for session in sessions:
+        try:
+            targets.append(DwarfPlanTarget(session))
+        except Exception:
+            log.exception("Could not plan for Dwarf %s", getattr(session, "dwarf_uid", "?"))
+    from smartscopes.manager import get_scope_manager
+
+    targets += [DriverPlanTarget(device) for device in get_scope_manager().all()]
+    return targets
 
 
 def _seconds(name: str) -> float:

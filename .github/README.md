@@ -134,6 +134,19 @@ Builds tonight's target list from [TonightPlan](https://tonightplan.cosmiccaptur
 - **Filter:** where the site recommends a dual-band or narrowband filter, a Seestar turns on its LP filter and a Dwarf 3 / Mini uses Duo-Band; otherwise a Dwarf uses its Astro filter.
 - **Dwarf extras:** only the night's first program calibrates (and autofocuses, if ticked). Targets bigger than the frame use the Dwarf's built-in mosaic (up to 1.8 × 1.8). Programs land in the Dwarf's normal Scripts queue and run with upstream's own Dwarf runner.
 
+### One plan for all telescopes
+
+The **✨** button on the dashboard (next to **Other smart telescopes**) opens the same list once for every telescope you have. Tick the targets you want; the app decides which telescope images which target and when, and shows that plan before anything is queued.
+
+- **By size:** each target goes to the telescope whose frame it fills best, so small galaxies and planetary nebulae go to the narrow field (Seestar S50) and big nebulae to the wide field (Dwarf 3). A target bigger than every frame goes to a telescope that can mosaic.
+- **By imaging time:** TonightPlan's suggested time (*≤ 1h*, *1–3h*, *3–6h*, ...) sets how long each slot wants to be. Reaching the low end comes first, the rest of the range second; spare time after that still goes to whatever is in the queue.
+- **By the sky:** a slot stays inside the target's window above 20°, each telescope takes its targets in the order they cross the sky, and time near the transit is preferred.
+- **Balancing:** if the targets that suit one telescope would have to share the night while the other stands idle, some move over, as long as they still fit its frame reasonably.
+- **No room:** when there are more targets than the night can hold, the ones that would squeeze the others below their suggested time are left out and named.
+- **Telescopes and settings:** untick a telescope to plan without it. Exposure, gain, autofocus, filter and mosaic are set per telescope under *Camera settings per telescope*.
+
+The per-telescope buttons are still there for planning a single telescope by hand.
+
 TonightPlan has no official data feed. The app reads the catalog from the site's page at most once a day, caches it locally in `Devices_Sessions/` (never committed), and recalculates the plan with the same astronomy library the site uses. Checked against the site's own code: identical results for all 221 targets across five nights and locations. If the site changes its page layout, the dialog says *"catalogue not found"* instead of guessing. The site's per-location skyline (trees, buildings) isn't available, because it only lives in your browser.
 
 ## HTTPS for phones
@@ -204,9 +217,10 @@ smartscopes/
 ├── coords.py        RA/Dec parsing (decimal or sexagesimal)
 ├── tonightplan.py   TonightPlan catalogue fetch + port of its planning rules
 ├── plan_targets.py  per-scope adapters for the TonightPlan dialog (drivers, Dwarfs)
+├── nightplan.py     shares the ticked targets between telescopes: framing, imaging time, slots
 ├── https.py         private CA + auto-renewed server certificate + TLS relay (port 8443)
 ├── branding.py      "Smartscope Session" name applied at startup
-├── ui/              dashboard section, /scopes/... pages, TonightPlan dialog, HTTPS setup
+├── ui/              dashboard section, /scopes/... pages, TonightPlan dialogs, HTTPS setup
 └── tests/           fake Seestar TCP server + protocol, runner and planner tests
 ```
 

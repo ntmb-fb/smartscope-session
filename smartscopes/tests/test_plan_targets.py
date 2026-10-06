@@ -84,3 +84,19 @@ def test_mosaic_framing_puts_long_side_on_long_axis():
     fx, fy = _mosaic_framing(cand("x", 0, 1, w=2, h=7), (176, 99))
     assert fx > fy
     assert _mosaic_framing(cand("small", 0, 1, w=1, h=1), (176, 99)) is None
+
+
+def test_shared_night_plan_writes_dwarf_programs(workdir):
+    """smartscopes/nightplan.py's slots go straight into save_programs()."""
+    from smartscopes import nightplan
+
+    target = DwarfPlanTarget(dwarf_session("2"))
+    dwarf = nightplan.Scope(target.uid, target.label, target.fov, mosaic=True)
+    s50 = nightplan.Scope("s50", "Seestar S50", (44, 77))
+    plan = nightplan.plan_night([cand("M31", 0, 6, w=6.3, h=2.7), cand("M74", 0, 6, w=0.35, h=0.33)], [dwarf, s50])
+    assert [c.id for c, _, _ in plan.slots["s50"]] == ["M74"]
+
+    paths = target.save_programs(plan.slots[target.uid], PlanOptions("15", 80, True, True, True), ZoneInfo("UTC"))
+    (cmd,) = _load(paths)
+    assert cmd["goto_manual"]["target"] == "M31" and cmd["setup_camera"]["doMosaic"]
+    assert cmd["id_command"]["tonightplan"]["fit"].startswith("mosaic")

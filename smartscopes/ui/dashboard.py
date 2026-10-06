@@ -161,11 +161,21 @@ class ScopeCardView:
             self._banner_detail.set_text("")
 
 
+def _open_night_plan() -> None:
+    from smartscopes.plan_targets import all_plan_targets
+    from smartscopes.ui.nightplan_dialog import open_nightplan_dialog
+
+    open_nightplan_dialog(all_plan_targets())
+
+
 def render_dashboard_section() -> None:
     devices = get_scope_manager().all()
     with ui.row().classes("items-center justify-between w-full mt-2"):
         ui.label("Other smart telescopes").classes("text-xl")
         with ui.row().classes("items-center gap-1"):
+            ui.button(icon="auto_awesome", on_click=_open_night_plan).props(
+                "flat round"
+            ).tooltip("Plan tonight for all telescopes (TonightPlan)")
             ui.button(icon="lock", on_click=lambda: ui.navigate.to("/scopes/https")).props(
                 "flat round"
             ).tooltip("HTTPS for phones (install as app)")
