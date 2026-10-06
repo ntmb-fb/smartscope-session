@@ -319,7 +319,7 @@ def _manual_panel(device: ScopeDevice) -> None:
         if d.supports(C.CAPTURE):
             with ui.row().classes("items-end gap-2 w-full"):
                 exp = (ui.select(list(model.exposures_s), value=model.exposures_s[0], label="Exposure (s)")
-                       if model.exposures_s else ui.number("Exposure (s)", value=10))
+                       if model.exposures_s else ui.number("Exposure (s)", value=10)).classes("w-28")
                 gain = ui.number("Gain", value=model.default_gain, format="%d").classes("w-20")
 
                 def start() -> None:

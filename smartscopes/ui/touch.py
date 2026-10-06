@@ -20,9 +20,10 @@ _CSS = """
 <style>
 @media (pointer: coarse) {
   .q-btn { min-height: 44px; }
-  .q-btn.q-btn--round { min-width: 44px; }
+  .q-btn.q-btn--round { min-width: 48px; min-height: 48px; }
   .q-btn--dense:not(.q-btn--round) { padding-left: 12px; padding-right: 12px; }
-  .q-btn--dense .q-icon { font-size: 24px; }
+  .q-btn .q-icon { font-size: 28px; }
+  .q-expansion-item .q-item { min-height: 56px; }
   body { zoom: 1.1; }
 }
 @media (pointer: coarse) and (min-width: 700px) {
