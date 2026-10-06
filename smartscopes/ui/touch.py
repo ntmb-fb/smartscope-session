@@ -9,8 +9,10 @@ shared head HTML rather than by editing each (mostly upstream) button.
 
 Text: the pages lean on 12-14px labels, small at arm's length on a
 tablet. The whole page is zoomed instead of restyling each label, so
-text, icons, fields and spacing grow together: 10% on phones, where
-width is scarce, 25% from tablet width up.
+text, icons, fields and spacing grow together. The pages are narrow
+centred columns (about 640px), so the zoom steps up with the screen's
+width until the column fills most of it: 10% on phones, where width is
+scarce, up to 70% on a 13" iPad held sideways.
 """
 from __future__ import annotations
 
@@ -25,6 +27,12 @@ _CSS = """
 }
 @media (pointer: coarse) and (min-width: 700px) {
   body { zoom: 1.25; }
+}
+@media (pointer: coarse) and (min-width: 1000px) {
+  body { zoom: 1.5; }
+}
+@media (pointer: coarse) and (min-width: 1300px) {
+  body { zoom: 1.7; }
 }
 </style>
 """
