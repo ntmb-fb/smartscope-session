@@ -294,7 +294,8 @@ def _status_panel(device: ScopeDevice) -> None:
 def _manual_panel(device: ScopeDevice) -> None:
     d = device.driver
     model = d.model
-    with ui.expansion("Manual control", icon="gamepad").classes("w-full"):
+    # In a card like the other panels (p-0: the expansion brings its own padding).
+    with ui.card().classes("w-full p-0"), ui.expansion("Manual control", icon="gamepad").classes("w-full"):
         with ui.row().classes("gap-2"):
             if d.supports(C.AUTOFOCUS):
                 ui.button("Autofocus", on_click=lambda: _op(device, "Autofocus", d.auto_focus))
