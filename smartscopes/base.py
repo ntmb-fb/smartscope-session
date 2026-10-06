@@ -37,6 +37,9 @@ class Capability(str, enum.Enum):
     LP_FILTER = "lp_filter"        # switchable light-pollution filter
     PARK = "park"
     TIME_LOCATION = "time_location"  # push host time + site location to the device
+    MANUAL_SLEW = "manual_slew"    # press-and-hold direction pad
+    FOCUSER = "focuser"            # manual focus steps
+    DEW_HEATER = "dew_heater"
 
 
 @dataclass(frozen=True)
@@ -124,6 +127,8 @@ class ScopeDriver(ABC):
     models: ClassVar[dict[str, ModelInfo]]
     default_port: ClassVar[int | None] = None
     option_fields: ClassVar[tuple[OptionField, ...]] = ()
+    # Direction-pad speeds, slowest first: label -> value passed to slew().
+    slew_speeds: ClassVar[dict[str, int]] = {}
 
     def __init__(self, entry: ScopeEntry):
         self.entry = entry
@@ -169,6 +174,28 @@ class ScopeDriver(ABC):
         raise DriverError("Not supported by this device")
 
     def park(self) -> None:
+        raise DriverError("Not supported by this device")
+
+    # --- manual controls (quick, return as soon as the device accepted) ---
+    def slew(self, angle_deg: int, speed: int) -> None:
+        """Start moving: 0 = right, 90 = up, 180 = left, 270 = down;
+        speed is one of slew_speeds' values. The driver must make the
+        device stop by itself after a few seconds if stop_slew() never
+        comes (lost connection, closed browser tab)."""
+        raise DriverError("Not supported by this device")
+
+    def stop_slew(self) -> None:
+        raise DriverError("Not supported by this device")
+
+    def focuser_position(self) -> int:
+        raise DriverError("Not supported by this device")
+
+    def move_focuser(self, steps: int) -> int:
+        """Relative move; returns the new position."""
+        raise DriverError("Not supported by this device")
+
+    def set_dew_heater(self, power_pct: int) -> None:
+        """0 = off."""
         raise DriverError("Not supported by this device")
 
     # --- capture (non-blocking start, then polled) --------------------

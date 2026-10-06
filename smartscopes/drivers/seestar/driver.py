@@ -19,11 +19,15 @@ from smartscopes.registry import register_driver
 
 log = logging.getLogger("smartscopes.seestar")
 
-_COMMON = frozenset({C.GOTO, C.AUTOFOCUS, C.CAPTURE, C.LP_FILTER, C.PARK, C.TIME_LOCATION})
+_COMMON = frozenset({C.GOTO, C.AUTOFOCUS, C.CAPTURE, C.LP_FILTER, C.PARK, C.TIME_LOCATION,
+                     C.MANUAL_SLEW, C.FOCUSER, C.DEW_HEATER})
 
 # Seconds a goto (slew + plate-solve + re-centre) / an autofocus may take.
 _GOTO_TIMEOUT_S = 300
 _AUTOFOCUS_TIMEOUT_S = 240
+# A slew command runs for this long unless stopped or renewed, so the
+# mount can't run away if the "stop" never arrives.
+_SLEW_BURST_S = 5
 
 
 @register_driver
@@ -42,6 +46,9 @@ class SeestarDriver(ScopeDriver):
         "s30pro": ModelInfo("s30pro", "Seestar S30 Pro", _COMMON, exposures_s=(10, 20, 30), default_gain=80,
                             fov_arcmin=(134, 239), image="seestar-s30pro.png"),
     }
+
+    # scope_speed_move units; 1440 is the top speed seestar_alp's joystick uses.
+    slew_speeds = {"Slow": 120, "Medium": 500, "Fast": 1440}
 
     option_fields = (
         OptionField(
@@ -166,6 +173,48 @@ class SeestarDriver(ScopeDriver):
         except SeestarError as exc:
             raise DriverError(f"Park failed: {exc}") from exc
 
+    # --- manual controls -------------------------------------------------
+    def slew(self, angle_deg, speed) -> None:
+        if self.client.event_state("AutoGoto") == "working":
+            raise DriverError("A goto is in progress")
+        try:
+            self.client.call("scope_speed_move", {
+                "speed": int(speed), "angle": int(angle_deg) % 360, "dur_sec": _SLEW_BURST_S,
+            }, timeout=5)
+        except SeestarError as exc:
+            raise DriverError(f"Move failed: {exc}") from exc
+
+    def stop_slew(self) -> None:
+        try:
+            self.client.call("scope_speed_move", {"speed": 0, "angle": 0, "dur_sec": 0}, timeout=5)
+        except SeestarError as exc:
+            raise DriverError(f"Stop failed: {exc}") from exc
+
+    def focuser_position(self) -> int:
+        try:
+            result = self.client.call("get_focuser_position", timeout=5)
+        except SeestarError as exc:
+            raise DriverError(f"Could not read the focuser: {exc}") from exc
+        if isinstance(result, dict):
+            result = result.get("step")
+        return int(result)
+
+    def move_focuser(self, steps) -> int:
+        # The firmware only takes an absolute position.
+        target = self.focuser_position() + int(steps)
+        try:
+            self.client.call("move_focuser", {"step": target, "ret_step": True}, timeout=15)
+        except SeestarError as exc:
+            raise DriverError(f"Focus move failed: {exc}") from exc
+        return target
+
+    def set_dew_heater(self, power_pct) -> None:
+        power = max(0, min(100, int(power_pct)))
+        try:
+            self.client.call("pi_output_set2", {"heater": {"state": power > 0, "value": power}})
+        except SeestarError as exc:
+            raise DriverError(f"Dew heater: {exc}") from exc
+
     # --- capture ---------------------------------------------------------
     def start_capture(self, settings: CaptureSettings) -> None:
         if settings.wide:
@@ -196,6 +245,10 @@ class SeestarDriver(ScopeDriver):
             raise DriverError(f"Could not stop stacking: {exc}") from exc
 
     def abort(self) -> None:
+        try:
+            self.stop_slew()
+        except DriverError:
+            pass
         for stage in ("AutoGoto", "Stack"):
             try:
                 self.client.call("iscope_stop_view", {"stage": stage}, timeout=5)

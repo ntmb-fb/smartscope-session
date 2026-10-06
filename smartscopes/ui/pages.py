@@ -132,6 +132,114 @@ async def _op(device: ScopeDevice, label: str, fn) -> None:
         device.op_lock.release()
 
 
+async def _quick(device: ScopeDevice, fn, *args):
+    """Like _op but for the instant manual controls (direction pad,
+    focus steps, dew heater): no "done" toast, and it doesn't hold
+    op_lock, so releasing the pad can always stop the mount."""
+    if device.is_running or device.op_lock.locked():
+        ui.notify("The telescope is busy", type="warning")
+        return None
+    try:
+        return await run.io_bound(fn, *args)
+    except (DriverError, ValueError, TypeError) as exc:
+        ui.notify(str(exc), type="negative", multi_line=True)
+        return None
+
+
+# Direction pad: 3x3 grid of (icon, angle); None = the stop button.
+_PAD = (
+    ("north_west", 135), ("north", 90), ("north_east", 45),
+    ("west", 180), None, ("east", 0),
+    ("south_west", 225), ("south", 270), ("south_east", 315),
+)
+_SLEW_RENEW_S = 3.0  # shorter than a driver's own auto-stop
+
+
+def _slew_pad(device: ScopeDevice) -> None:
+    d = device.driver
+    held = {"angle": None}
+
+    async def start(angle: int) -> None:
+        # A touch fires touchstart *and* a synthetic mousedown.
+        if held["angle"] == angle:
+            return
+        held["angle"] = angle
+        await _quick(device, d.slew, angle, d.slew_speeds[speed.value])
+
+    async def stop() -> None:
+        if held["angle"] is None:
+            return
+        held["angle"] = None
+        await force_stop()
+
+    async def force_stop() -> None:
+        held["angle"] = None
+        try:
+            await run.io_bound(d.stop_slew)
+        except DriverError as exc:
+            ui.notify(str(exc), type="negative")
+
+    async def renew() -> None:
+        if held["angle"] is not None:
+            await _quick(device, d.slew, held["angle"], d.slew_speeds[speed.value])
+
+    with ui.column().classes("items-center gap-2"):
+        with ui.grid(columns=3).classes("w-48 gap-1"):
+            for cell in _PAD:
+                if cell is None:
+                    ui.button(icon="stop", on_click=force_stop).props("round color=negative").classes("w-14 h-14")
+                    continue
+                icon, angle = cell
+                btn = ui.button(icon=icon).props("round outline").classes("w-14 h-14").style(
+                    "touch-action: none; -webkit-user-select: none; -webkit-touch-callout: none")
+                # Hold to move; stop on release or when the finger/pointer
+                # slides off the button.
+                for event in ("mousedown", "touchstart"):
+                    btn.on(event, lambda _, a=angle: start(a))
+                for event in ("mouseup", "mouseleave", "touchend", "touchcancel"):
+                    btn.on(event, lambda _: stop())
+        speed = ui.toggle(list(d.slew_speeds), value=next(iter(d.slew_speeds)))
+        ui.label("Hold an arrow to move").classes("text-xs text-grey-6")
+    ui.timer(_SLEW_RENEW_S, renew)
+
+
+def _focuser_row(device: ScopeDevice) -> None:
+    d = device.driver
+    with ui.row().classes("items-center gap-2 w-full"):
+        ui.label("Focus")
+        position = ui.label("–").classes("w-12 text-center")
+
+        async def move(steps: int) -> None:
+            new = await _quick(device, d.move_focuser, steps)
+            if new is not None:
+                position.set_text(str(new))
+
+        for steps in (-50, -10, 10, 50):
+            ui.button(f"{steps:+d}", on_click=lambda _, s=steps: move(s)).props("outline")
+
+    async def read() -> None:
+        if d.is_connected() and not device.is_running:
+            try:
+                position.set_text(str(await run.io_bound(d.focuser_position)))
+            except Exception:
+                pass
+
+    ui.timer(0.5, read, once=True)
+
+
+def _dew_heater_row(device: ScopeDevice) -> None:
+    d = device.driver
+    with ui.row().classes("items-end gap-2 w-full"):
+        power = ui.select({0: "Off", 25: "25%", 50: "50%", 75: "75%", 100: "100%"}, value=0,
+                          label="Dew heater").classes("w-28")
+
+        async def apply() -> None:
+            if await _quick(device, lambda: d.set_dew_heater(power.value) or True):
+                ui.notify(f"Dew heater {'off' if not power.value else f'{power.value}%'}", type="positive")
+
+        ui.button("Set", on_click=apply)
+
+
 def _status_panel(device: ScopeDevice) -> None:
     driver = device.driver
     with ui.card().classes("w-full"):
@@ -218,6 +326,13 @@ def _manual_panel(device: ScopeDevice) -> None:
 
                 ui.button("Start stacking", on_click=lambda: _op(device, "Start stacking", start))
                 ui.button("Stop stacking", on_click=lambda: _op(device, "Stop stacking", d.stop_capture))
+
+        if d.supports(C.MANUAL_SLEW) and d.slew_speeds:
+            _slew_pad(device)
+        if d.supports(C.FOCUSER):
+            _focuser_row(device)
+        if d.supports(C.DEW_HEATER):
+            _dew_heater_row(device)
 
 
 def _program_panel(device: ScopeDevice) -> None:

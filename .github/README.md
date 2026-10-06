@@ -113,7 +113,7 @@ Save it as a `.pem` file and enter its path in the telescope's **Settings** in t
 ### What you can do
 
 - **Status:** battery, temperature, free storage, position, stacking progress (frames stacked and dropped).
-- **Manual control:** goto by RA/Dec, autofocus, start/stop stacking, LP filter, park, stop all.
+- **Manual control:** goto by RA/Dec, autofocus, start/stop stacking, LP filter, park, stop all, a hold-to-move direction pad (three speeds), focus in/out by steps, dew heater power.
 - **Programs:** target, coordinates, start time, exposure (10/20/30 s), gain, frame count and/or stop time, autofocus, LP filter. Choose *Run now* or *Add to queue*. The queue shows each program's time window, settings, TonightPlan info and, once finished, its result.
 - **Scheduler:** off by default; when armed, due programs start automatically, one after another.
 

@@ -121,6 +121,29 @@ def test_status_goto_focus():
         fake.close()
 
 
+def test_manual_controls():
+    fake = FakeSeestar()
+    driver = _driver(fake)
+    try:
+        driver.connect()
+        driver.slew(90, driver.slew_speeds["Slow"])
+        driver.stop_slew()
+        moves = [m["params"] for m in fake.received if m["method"] == "scope_speed_move"]
+        assert moves[0]["angle"] == 90 and moves[0]["speed"] == 120 and moves[0]["dur_sec"] > 0
+        assert moves[1]["speed"] == 0
+
+        assert driver.move_focuser(-20) == 1560 and fake.focus_step == 1560
+        assert driver.focuser_position() == 1560
+
+        driver.set_dew_heater(40)
+        driver.set_dew_heater(0)
+        heater = [m["params"]["heater"] for m in fake.received if m["method"] == "pi_output_set2"]
+        assert heater == [{"state": True, "value": 40}, {"state": False, "value": 0}]
+    finally:
+        driver.disconnect()
+        fake.close()
+
+
 # --- full program run -----------------------------------------------------------
 
 def test_program_file_runs_to_done(tmp_path, monkeypatch):

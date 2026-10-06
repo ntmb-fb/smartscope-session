@@ -25,6 +25,7 @@ class FakeSeestar:
         self.port = self._server.getsockname()[1]
         self._conn: socket.socket | None = None
         self._stacking = threading.Event()
+        self.focus_step = 1580
         threading.Thread(target=self._accept, daemon=True).start()
 
     def close(self) -> None:
@@ -106,6 +107,11 @@ class FakeSeestar:
             })
         if method == "scope_get_equ_coord":
             return self._reply(msg, {"ra": 5.58, "dec": -5.39})
+        if method == "get_focuser_position":
+            return self._reply(msg, self.focus_step)
+        if method == "move_focuser":
+            self.focus_step = msg["params"]["step"]
+            return self._reply(msg, {"step": self.focus_step})
         if method == "iscope_start_view":
             self._reply(msg)
             if "target_ra_dec" in msg["params"]:
