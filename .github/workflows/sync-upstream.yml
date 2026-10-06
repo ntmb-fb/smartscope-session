@@ -17,7 +17,7 @@ jobs:
     if: github.repository != 'stevejcl/astro_dwarf_session'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           ref: smartscope
           fetch-depth: 0

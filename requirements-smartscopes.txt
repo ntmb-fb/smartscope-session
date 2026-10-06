@@ -1,5 +1,5 @@
 # Extra dependencies for the smartscopes/ package (non-Dwarf telescopes).
 # Kept separate from requirements.txt so upstream merges never conflict.
-cryptography   # Seestar firmware 7.18+ challenge signing
+cryptography>=42   # Seestar firmware 7.18+ challenge signing; HTTPS certificates (not_valid_after_utc)
 tzlocal        # IANA time-zone name pushed to the Seestar
 astronomy-engine  # TonightPlan import: same astronomy library the site uses
