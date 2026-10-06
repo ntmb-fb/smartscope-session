@@ -147,6 +147,17 @@ The **✨** button on the dashboard (next to **Other smart telescopes**) opens t
 
 The per-telescope buttons are still there for planning a single telescope by hand.
 
+### The app's own catalogue
+
+The list no longer depends on TonightPlan being reachable. The app ships its own catalogue of about 700 objects a smart telescope can image, built from [OpenNGC](https://github.com/mattiaverga/OpenNGC) (NGC, IC, Messier) and Sharpless' emission nebulae, and does all the planning itself.
+
+- **What it estimates:** season from the object's position; filter from its type (dual-band for emission and planetary nebulae and supernova remnants); imaging time and the sky it needs from its brightness; and a rough rating from size, brightness and whether it is a well-known object.
+- **TonightPlan on top:** wherever TonightPlan knows an object, its hand-made entry replaces ours, and within each rating group its targets are listed first. Ours are marked *estimated rating*.
+- **If TonightPlan is down or changes its page:** its last saved copy is used; without one, the list is built from the app's catalogue alone, and the dialog says so.
+- **Long lists:** the dialog shows the best 60 of the night.
+
+The estimates are a formula, not a judgement: they can't tell a photogenic object from a dull one of the same size and brightness. `tools/build_catalogue.py` holds the rules and rebuilds `smartscopes/data/catalogue.json`.
+
 TonightPlan has no official data feed. The app reads the catalog from the site's page at most once a day, caches it locally in `Devices_Sessions/` (never committed), and recalculates the plan with the same astronomy library the site uses. Checked against the site's own code: identical results for all 221 targets across five nights and locations. If the site changes its page layout, the dialog says *"catalogue not found"* instead of guessing. The site's per-location skyline (trees, buildings) isn't available, because it only lives in your browser.
 
 ## HTTPS for phones
@@ -216,6 +227,7 @@ smartscopes/
 ├── programs.py      build/list/describe program files (reuses upstream's template)
 ├── coords.py        RA/Dec parsing (decimal or sexagesimal)
 ├── tonightplan.py   TonightPlan catalogue fetch + port of its planning rules
+├── catalogue.py     the app's own catalogue (data/catalogue.json), TonightPlan's ratings laid over it
 ├── plan_targets.py  per-scope adapters for the TonightPlan dialog (drivers, Dwarfs)
 ├── nightplan.py     shares the ticked targets between telescopes: framing, imaging time, slots
 ├── https.py         private CA + auto-renewed server certificate + TLS relay (port 8443)
@@ -252,6 +264,7 @@ To report to stevejcl:
 - **[astro_dwarf_session](https://github.com/stevejcl/astro_dwarf_session)** and **[dwarf_python_api](https://github.com/stevejcl/dwarf_python_api)** by stevejcl: the app this fork builds on (MIT).
 - **[seestar_alp](https://github.com/smart-underworld/seestar_alp):** the community's documentation of the Seestar protocol; the Seestar client here is an independent implementation.
 - **[TonightPlan](https://tonightplan.cosmiccaptures.com/)** by Tim Ciasto / Cosmic Captures: target ratings and notes, fetched live for personal use.
+- **[OpenNGC](https://github.com/mattiaverga/OpenNGC)** by Mattia Verga (CC-BY-SA-4.0) and **Sharpless' catalogue of H II regions** (1959, through VizieR): the positions, sizes and brightnesses behind `smartscopes/data/catalogue.json`, which is derived from them and shared under the same CC-BY-SA-4.0 terms.
 - **Seestar pictures:** original 3D renders made with [Blender](https://www.blender.org/) (`tools/render_seestars.py`), not manufacturer photos.
 - **[Astronomy Engine](https://github.com/cosinekitty/astronomy)** by Don Cross (MIT): sun, Moon and target positions.
 

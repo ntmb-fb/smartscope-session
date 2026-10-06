@@ -125,7 +125,7 @@ def _plan_meta(c: tp.Candidate, tz, fit_text: str) -> dict:
     return {"visual_impact": t["visual_impact"], "smart_scope": t.get("smart_scope"),
             "imaging_time": t.get("imaging_time"), "fit": fit_text, "peak_alt": c.peak_alt,
             "peak_time": f"{c.peak_time.astimezone(tz):%H:%M}", "moon_status": c.moon_status,
-            "url": tp.SITE_URL}
+            "url": "" if t.get("estimated") else tp.SITE_URL}
 
 
 def _wants_filter(c: tp.Candidate) -> bool:

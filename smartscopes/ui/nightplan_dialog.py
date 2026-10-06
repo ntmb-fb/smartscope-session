@@ -11,9 +11,10 @@ from zoneinfo import ZoneInfo
 from nicegui import run, ui
 
 from smartscopes import nightplan
+from smartscopes import catalogue
 from smartscopes import tonightplan as tp
 from smartscopes.plan_targets import FIT_TEXT, PlanOptions, PlanTarget, get_pref, set_pref
-from smartscopes.ui.tonightplan_dialog import _IMPACT_COLOR, _local_tz_name
+from smartscopes.ui.tonightplan_dialog import _IMPACT_COLOR, _MAX_ROWS, _local_tz_name
 
 _PREF_UID = "_all"               # this dialog's own remembered location / sky
 _AUTO_TICK_PER_SCOPE = 2
@@ -82,8 +83,9 @@ def open_nightplan_dialog(targets: list[PlanTarget]) -> None:
         with ui.row().classes("w-full justify-end gap-2"):
             ui.button("Cancel", on_click=dialog.close).props("flat")
             add_btn = ui.button("Add to queues")
-        ui.label("Ratings and notes © Tim Ciasto / Cosmic Captures. Moon-greyed and "
-                 "smart-scope 'Challenging' targets are left out.").classes("text-xs text-grey-6")
+        ui.label("Ratings © Tim Ciasto / Cosmic Captures where TonightPlan knows the object; the rest are "
+                 "estimates from the app's own catalogue (OpenNGC, Sharpless). Moon-greyed and "
+                 "'Challenging' targets are left out.").classes("text-xs text-grey-6")
 
     state: dict = {"candidates": [], "checks": {}, "tz": None, "plan": None, "generation": 0}
 
@@ -111,18 +113,20 @@ def open_nightplan_dialog(targets: list[PlanTarget]) -> None:
         with body:
             ui.spinner()
         try:
-            catalogue = await run.io_bound(tp.fetch_catalogue, force=force)
+            targets_all, note = await run.io_bound(lambda: catalogue.load(force=force))
             night, candidates = await run.io_bound(
-                lambda: tp.rank_tonight(catalogue, lat=loc.lat, lon=loc.lon, tz_name=tz_name, sky=sky_sel.value))
+                lambda: tp.rank_tonight(targets_all, lat=loc.lat, lon=loc.lon, tz_name=tz_name, sky=sky_sel.value))
         except tp.TonightPlanError as exc:
             body.clear()
             with body:
                 ui.label(str(exc)).classes("text-negative")
             return
-        state["candidates"] = nightplan.order_for_scopes(candidates, scopes(targets))
+        state["candidates"] = nightplan.order_for_scopes(candidates, scopes(targets))[:_MAX_ROWS]
         dark = "darkness" if not night.twilight_tier else ("nautical twilight only", "civil twilight only")[night.twilight_tier - 1]
         summary.set_text(f"{dark} {night.evening.astimezone(tz):%H:%M}–{night.morning.astimezone(tz):%H:%M} · "
-                         f"Moon {night.moon_illum}% (up to {night.moon_peak_alt}°) · {len(candidates)} targets")
+                         f"Moon {night.moon_illum}% (up to {night.moon_peak_alt}°) · "
+                         + (f"best {_MAX_ROWS} of {len(candidates)} targets" if len(candidates) > _MAX_ROWS
+                            else f"{len(candidates)} targets") + (f" · {note}" if note else ""))
         render()
         await replan()
 
@@ -151,6 +155,8 @@ def open_nightplan_dialog(targets: list[PlanTarget]) -> None:
                         bits.append(f"suggested {t.get('imaging_time', '?')}")
                         if c.moon_status == "ok":
                             bits.append("some Moon")
+                        if t.get("estimated"):
+                            bits.append("estimated rating")
                         ui.label(" · ".join(bits)).classes("text-xs text-grey-7")
                         fits = [(s, nightplan.framing(t, s)[0]) for s in all_scopes]
                         ui.label(" · ".join(

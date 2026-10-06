@@ -108,7 +108,7 @@ def order_for_scopes(candidates: list[tp.Candidate], scopes: list[Scope]) -> lis
         return bool(scopes) and all(framing(c.target, s)[1] < _Q_TIGHT for s in scopes)
 
     return sorted(candidates, key=lambda c: (tp._IMPACT_ORDER.get(c.target["visual_impact"], 2),
-                                             too_big(c), -c.score))
+                                             bool(c.target.get("estimated")), too_big(c), -c.score))
 
 
 # --- one telescope's night --------------------------------------------------------------------

@@ -377,6 +377,7 @@ def rank_tonight(
         ))
 
     out.sort(key=lambda c: (_IMPACT_ORDER.get(c.target["visual_impact"], 2),
+                            bool(c.target.get("estimated")),  # our own estimates: after the site's ratings
                             c.fit == "no",  # needs a mosaic: after the ones that fit
                             -c.score))
     return night, out
