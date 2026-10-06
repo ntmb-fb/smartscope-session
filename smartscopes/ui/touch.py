@@ -24,6 +24,8 @@ _CSS = """
   .q-btn--dense:not(.q-btn--round) { padding-left: 12px; padding-right: 12px; }
   .q-btn .q-icon { font-size: 28px; }
   .q-expansion-item .q-item { min-height: 56px; }
+  .q-expansion-item__container > .q-item .q-item__label { font-size: 18px; font-weight: 500; }
+  .q-expansion-item__container > .q-item .q-item__section--avatar .q-icon { font-size: 30px; }
   body { zoom: 1.1; }
 }
 @media (pointer: coarse) and (min-width: 700px) {
