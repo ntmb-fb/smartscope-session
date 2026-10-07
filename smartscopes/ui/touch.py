@@ -16,7 +16,7 @@ scarce, up to 70% on a 13" iPad held sideways.
 """
 from __future__ import annotations
 
-_CSS = """
+_CSS = r"""
 <style>
 @media (pointer: coarse) {
   .q-btn { min-height: 44px; }
@@ -29,16 +29,23 @@ _CSS = """
   body { zoom: 1.1; }
 }
 @media (pointer: coarse) and (min-width: 700px) {
-  body { zoom: 1.25; font-size: 16px; }
-  /* Tablets have the room: one step up for the small text sizes the cards,
-     hints and the log viewer use, and for panel titles and icons. "body"
-     only lifts these above Tailwind's own rules, which load later. */
-  body .text-xs { font-size: 0.875rem; line-height: 1.25rem; }
-  body .text-sm, body .md\:text-sm { font-size: 1rem; line-height: 1.5rem; }
-  body .md\:text-base { font-size: 1.125rem; line-height: 1.75rem; }
+  body { zoom: 1.25; font-size: 20px; }
+  /* Tablets have the room: larger sizes for the text the cards, hints,
+     target lists and the log viewer use, and for buttons, fields, panel
+     titles and icons. "body" only lifts the Tailwind sizes above
+     Tailwind's own rules, which load later. */
+  body .text-xs { font-size: 1rem; line-height: 1.5rem; }
+  body .text-sm, body .md\:text-sm { font-size: 1.25rem; line-height: 1.75rem; }
+  body .md\:text-base { font-size: 1.375rem; line-height: 1.875rem; }
+  body .text-lg { font-size: 1.5rem; line-height: 2rem; }       /* headings stay above body text */
+  body .text-xl { font-size: 1.625rem; line-height: 2.125rem; }
+  body .q-badge.w-24 { width: 8.5rem; justify-content: center; }
   [style*="monospace"] { font-size: 15px !important; }
-  .q-btn .q-icon { font-size: 32px; }
-  .q-expansion-item__container > .q-item .q-item__label { font-size: 22px; }
+  .q-btn { font-size: 18px; }
+  .q-btn .q-icon { font-size: 36px; }
+  .q-field, .q-checkbox, .q-toggle, .q-item { font-size: 18px; }
+  .q-badge { font-size: 15px; padding: 4px 8px; }
+  .q-expansion-item__container > .q-item .q-item__label { font-size: 24px; }
   .q-expansion-item__container > .q-item .q-item__section--avatar .q-icon { font-size: 36px; }
 }
 @media (pointer: coarse) and (min-width: 1000px) {
