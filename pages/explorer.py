@@ -19,14 +19,23 @@ themselves, only the JSON listing call."""
 from __future__ import annotations
 
 import asyncio
+import inspect
 from datetime import datetime
+from pathlib import Path
+
+import re
+from urllib.parse import quote
 
 import requests
-from nicegui import run, ui
+from fastapi import HTTPException
+from fastapi.responses import Response
+from nicegui import app, background_tasks, run, ui
 
 from dwarf_python_api.lib.dwarf_session import get_manager
 from dwarf_python_api.lib.dwarf_utils import perform_list_astro_sessions_http
+import dwarf_python_api.lib.my_logger as log
 
+from components import dwarf_media, scope_archive
 from components.i18n import t
 from components.pwa import add_pwa_head_tags
 from components.theme import apply_theme
@@ -117,7 +126,74 @@ def _format_datetime(unix_ts) -> str:
         return ""
 
 
+def _download_name(path: str) -> str:
+    """File name to save under: the Dwarf's own name when it says what
+    the session is ("stacked-16_M 42 ..._60s40_Duo-Band_...png"), else
+    the session folder before it (stacked.jpg says nothing on its own)."""
+    parts = path.strip("/").split("/")
+    base = parts[-1]
+    stem = base.rsplit(".", 1)[0]
+    name = base if stem.lower() not in ("stacked", "stacked_thumbnail") and len(parts) >= 1 else "_".join(parts[-2:])
+    return re.sub(r'[\\/:*?"<>|]', "_", name)
+
+
+def _content_disposition(name: str) -> str:
+    # HTTP headers are latin-1: ASCII fallback + the UTF-8 name (RFC 6266)
+    ascii_name = name.encode("ascii", "replace").decode("ascii").replace("?", "_")
+    return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(name)}"
+
+
+def _write_file(target: Path, data: bytes) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(data)
+
+
+async def _save_path(name: str) -> Path | None:
+    """Where to save in the native window (pywebview): the user's own
+    Save dialog, else the Downloads folder (user-reported Oct 2026: the
+    browser download does nothing there, unlike in a real browser).
+    NiceGUI's window proxy is async: its create_file_dialog() is awaited
+    (user-reported Oct 2026: called in a thread, it returned a coroutine
+    and the save failed)."""
+    window = getattr(app.native, "main_window", None)
+    if window is not None:
+        try:
+            import webview  # only present with the native window
+            chosen = window.create_file_dialog(webview.FileDialog.SAVE, save_filename=name)
+            if inspect.isawaitable(chosen):
+                chosen = await chosen
+        except Exception as e:  # any pywebview/platform failure: the fallback below
+            log.debug(f"Native save dialog unavailable ({e})")
+        else:
+            if not chosen:
+                return None  # cancelled
+            return Path(chosen[0] if isinstance(chosen, (list, tuple)) else chosen)
+    return Path.home() / "Downloads" / name
+
+
 def build_explorer_page() -> None:
+    # Image download (user-requested Oct 2026): fetched from the Dwarf by
+    # this backend and sent back as an attachment - the browser's own
+    # download attribute is ignored for another origin (the Dwarf), it
+    # would just open the image.
+    @app.get("/session/{dwarf_uid}/explorer/download")
+    async def explorer_download(dwarf_uid: str, path: str) -> Response:
+        try:
+            session = get_manager().get(dwarf_uid)
+        except KeyError:
+            raise HTTPException(status_code=404)
+        # Only the Dwarf's own media files
+        if not path.startswith("/") or ".." in path or not session.config.dwarf_ip:
+            raise HTTPException(status_code=400)
+        data = await run.io_bound(dwarf_media.fetch, session.config.dwarf_ip, path)
+        if data is None:
+            raise HTTPException(status_code=502)
+        return Response(
+            data,
+            media_type="image/png" if path.lower().endswith(".png") else "image/jpeg",
+            headers={"Content-Disposition": _content_disposition(_download_name(path))},
+        )
+
     @ui.page("/session/{dwarf_uid}/explorer")
     def explorer_page(dwarf_uid: str) -> None:
         add_pwa_head_tags()
@@ -165,7 +241,20 @@ def build_explorer_page() -> None:
                 with ui.column().classes("w-full gap-1 p-3"):
                     with ui.row().classes("w-full justify-between items-center"):
                         dialog_target_label = ui.label("").classes("text-base font-medium")
-                        ui.button(icon="close", on_click=dialog.close).props("flat round dense")
+                        with ui.row().classes("gap-1 items-center"):
+                            # Archive with Dwarfium Scope Archive: its import page then its
+                            # Transfer page, in its own window when it has one (scope_archive.py)
+                            archive_link = ui.button(
+                                icon="inventory_2",
+                                on_click=lambda: scope_archive.archive_session(session.config, current_path[0]),
+                            ).props("flat round dense").tooltip(t("archive_in_scope_archive"))
+                            with ui.button(icon="download").props("flat round dense").tooltip(
+                                t("explorer_download")
+                            ):
+                                with ui.menu() as download_menu:
+                                    ui.menu_item("JPG", on_click=lambda: _download_current("jpg"))
+                                    png_item = ui.menu_item("PNG", on_click=lambda: _download_current("png"))
+                            ui.button(icon="close", on_click=dialog.close).props("flat round dense")
                     # Date/Exposure/Gain (user-requested Sep 2026: "Date,
                     # Cible et details de prise de vue") - all read
                     # directly from the SAME listing entry already in
@@ -196,7 +285,55 @@ def build_explorer_page() -> None:
                     _shots_info_cache[thumb_path] = await run.io_bound(_fetch_shots_info, url)
                 return _shots_info_cache[thumb_path]
 
+            current_path: list[str] = [""]
+            current_png: list[str | None] = [None]
+
+            async def _download_current(kind: str) -> None:
+                """JPG (the album's own stacked.jpg) or the session's PNG.
+                In the native window the file is written here and the
+                path shown; in a browser it is the browser's download."""
+                download_menu.close()
+                path = current_png[0] if kind == "png" else current_path[0]
+                if not path:
+                    return
+                name = _download_name(path)
+                if getattr(app.native, "main_window", None) is None:
+                    ui.download.from_url(
+                        f"/session/{dwarf_uid}/explorer/download?path={quote(path)}", filename=name
+                    )
+                    return
+                target = await _save_path(name)
+                if target is None:
+                    return  # cancelled
+                notification = ui.notification(t("explorer_downloading"), spinner=True, timeout=None)
+                try:
+                    data = await run.io_bound(dwarf_media.fetch, session.config.dwarf_ip, path)
+                    if data is None:
+                        notification.dismiss()
+                        ui.notify(t("explorer_download_failed"), type="negative")
+                        return
+                    await run.io_bound(_write_file, target, data)
+                except OSError as e:
+                    notification.dismiss()
+                    ui.notify(f"{t('explorer_download_failed')} ({e})", type="negative")
+                    return
+                notification.dismiss()
+                ui.notify(t("explorer_downloaded", path=str(target)), type="positive", timeout=8000)
+
+            async def _look_for_png(path: str) -> None:
+                """The session's PNG, looked for over FTP when the large
+                view opens (the album listing only gives the JPG)."""
+                current_png[0] = None
+                png_item.set_visibility(False)
+                found = await run.io_bound(dwarf_media.png_path, session.config.dwarf_ip, path)
+                if found and current_path[0] == path:
+                    current_png[0] = found
+                    png_item.set_visibility(True)
+
             async def open_dialog(entry: dict) -> None:
+                current_path[0] = entry["filePath"]
+                archive_link.set_visibility(scope_archive.transfer_url(session.config, entry["filePath"]) is not None)
+                background_tasks.create(_look_for_png(entry["filePath"]))
                 url = _thumbnail_url(session.config.dwarf_ip, entry["filePath"])
                 full_image.set_source(url)
                 dialog_target_label.set_text(_target_name(entry))

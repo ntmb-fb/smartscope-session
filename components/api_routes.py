@@ -28,6 +28,10 @@ POST /api/schedule
     - Otherwise: store it via `pending_schedules.set_pending()`; it will
       be offered for synchronization the next time THAT device connects
       (see the hook in `pages/session.py::_handle_connect`).
+    - A task may carry a "catalogMeta" block (id, type, mag, size, con,
+      commonName, messier - see js/dwarf-scheduler.js): the object is
+      added to catalog_add_on.json (components/catalog_add_on.py) if
+      not already known, and the block is removed before storing/sending.
 
     -> {"ok": true, "mode": "sent"|"pending", ...}
 
@@ -78,12 +82,13 @@ from __future__ import annotations
 import json
 import os
 import sys
-from datetime import datetime, timedelta
+from datetime import timedelta
 from pathlib import Path
 
 from fastapi import Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from nicegui import app, run
 
 from dwarf_python_api.lib.dwarf_config import DwarfConfig
@@ -95,10 +100,13 @@ from dwarf_python_api.get_config_data import config_to_dwarf_id_str
 
 from device_registry import list_device_entries
 from site_registry import list_site_entries
-from components import connection_health, scheduler_runner, scheduler_loop, native_schedule
+from components import connection_health, scheduler_runner, scheduler_loop, native_schedule, catalog_add_on
+from components import scope_archive, task_check, task_check_cache
+from components.json_files import write_json_atomic
 from components.device_card import _DEVICE_TYPE_ICONS
 from components.program_editor import _blank_program, _filename_for
 from components.session_dirs import ensure_dirs
+from components.site_time import site_from_timestamp, site_now
 from components.native_schedule import parse_native_schedule_info
 import pending_schedules
 import dwarf_python_api.lib.my_logger as log
@@ -124,22 +132,21 @@ def _bundled_path(relative: str) -> Path:
 
 def _external_path(relative: str) -> Path:
     """Resolves a data file meant to be REPLACEABLE without rebuilding
-    the .exe (user-requested Sep 2026, for the Milky Way mosaic planner
-    specifically - still under active iteration, unlike catalog.html's
-    stable third-party content, so requiring a full rebuild for every
-    tweak would be painful). Unlike _bundled_path() above, this reads
-    next to the ACTUAL RUNNING .exe (sys.executable's own folder) in a
-    packaged build - not sys._MEIPASS, which is a fresh temp extraction
-    dir every launch and can never be edited persistently. Matches how
-    images/ and components/locales/ are already handled: copied as
-    LOOSE files into dist/ by buildAstroDwarfUI.py, not baked in via
-    --add-data, so replacing the file next to the .exe takes effect on
-    the next launch with no rebuild at all."""
+    the .exe: today only catalog.html, third-party content from an
+    external project that can be updated independently of this app
+    (user-requested Sep 2026). Unlike _bundled_path() above, this reads
+    from assets/ next to the ACTUAL RUNNING .exe (sys.executable's own
+    folder) in a packaged build - not sys._MEIPASS, which is a fresh
+    temp extraction dir every launch and can never be edited
+    persistently. Copied there as a LOOSE file by buildAstroDwarfUI.py
+    (dist/assets/), not baked in via --add-data, so replacing the file
+    takes effect on the next launch with no rebuild at all. Pass only
+    the file name (e.g. "catalog.html"): "assets/" is added here."""
     if getattr(sys, "frozen", False):
         base_dir = Path(sys.executable).resolve().parent
     else:
         base_dir = Path(__file__).resolve().parent.parent
-    return base_dir / relative
+    return base_dir / "assets" / relative
 
 
 def _model_display_name(cfg: DwarfConfig) -> str:
@@ -242,6 +249,11 @@ def register_api_routes() -> None:
         allow_headers=["*"],
     )
 
+    # Montage des fichiers statiques (JS, CSS...) du projet
+    root_dir = _bundled_path("")
+    js_dir = root_dir / "js"
+    if js_dir.exists():
+        app.mount("/js", StaticFiles(directory=str(js_dir)), name="js")
     @app.get("/catalog")
     def catalog_page():
         """Serves the DSO catalog page over THIS server's own http://,
@@ -257,12 +269,12 @@ def register_api_routes() -> None:
 
         Looks for catalog.html next to astro_dwarf_ui.py in a source
         checkout, or bundled into the .exe in a packaged build (see
-        _bundled_path() above) - drop the downloaded catalog file at
+        _external_path() above) - drop the downloaded catalog file at
         the project root under that exact name for this route to find
         it in dev mode; a packaged build needs it present at build time
         instead (buildAstroDwarfUI.py bundles it via --add-data).
         """
-        catalog_path = _bundled_path("catalog.html")
+        catalog_path = _external_path("catalog.html")
         if not catalog_path.exists():
             return JSONResponse(
                 {"error": f"catalog.html not found at {catalog_path} - place the DSO catalog HTML file there."},
@@ -274,13 +286,7 @@ def register_api_routes() -> None:
     def mosaic_planner_page(lang: str):
         """Serves the Milky Way mosaic planner the same way /catalog
         serves catalog.html above - same-origin with /api/*, secure-
-        context geolocation on mobile, etc. Uses _external_path()
-        rather than _bundled_path() (see that function's own docstring)
-        specifically because this file is still under active iteration
-        - drop an updated milky_way_mosaic_planner_<lang>.html next to
-        the project root (dev) or the built .exe (packaged) and it
-        takes effect on the very next request, no rebuild needed
-        either way.
+        context geolocation on mobile, etc. Uses _bundled_path().
 
         {lang} is "fr" or "en" (user-requested Sep 2026: no real i18n
         system in this standalone file yet - just two full copies, one
@@ -292,7 +298,7 @@ def register_api_routes() -> None:
         """
         if lang not in ("fr", "en"):
             lang = "fr"
-        planner_path = _external_path(f"milky_way_mosaic_planner_{lang}.html")
+        planner_path = _bundled_path(f"milky_way_mosaic_planner_{lang}.html")
         if not planner_path.exists():
             return JSONResponse(
                 {"error": f"milky_way_mosaic_planner_{lang}.html not found at {planner_path} - place the mosaic planner HTML file there."},
@@ -393,6 +399,7 @@ def register_api_routes() -> None:
                 finally:
                     connection_health.release_command_slot(dwarf_uid)
                 if info is not None:
+                    log.info(f"schedule_info: {info}")
                     parsed = parse_native_schedule_info(info)
                     native_schedule.set_cached(dwarf_uid, parsed)
                     device_entry["nativeSchedule"] = parsed
@@ -400,8 +407,52 @@ def register_api_routes() -> None:
                 else:
                     _fill_native_from_cache(device_entry, dwarf_uid, "read_failed")
 
+            # Counts found by an earlier View / Check (task_check_cache.py),
+            # on a copy: the native cache itself stays as read from the Dwarf
+            if device_entry.get("nativeSchedule"):
+                device_entry["nativeSchedule"] = [
+                    {**sched, "tasks": [
+                        {**task, "check": task_check_cache.get(dwarf_uid, task)}
+                        for task in sched.get("tasks") or []
+                    ]}
+                    for sched in device_entry["nativeSchedule"]
+                ]
             out.append(device_entry)
         return JSONResponse({"devices": out})
+
+    @app.get("/api/task-check/{dwarf_uid}")
+    async def api_task_check(dwarf_uid: str, start: int, end: int, name: str = ""):
+        """What the Dwarf saved for a native task or a program run (the
+        Program page's View / Check buttons) - task_check.summarize(),
+        plus the stacked thumbnail's URL on the Dwarf itself."""
+        try:
+            session = get_manager().get(dwarf_uid)
+        except KeyError:
+            return JSONResponse({"status": "unknown_device"}, status_code=404)
+        if not session.config.dwarf_ip:
+            return JSONResponse({"status": "album_error"})
+        task = {"name": name, "startTime": start, "endTime": end}
+        result = await run.io_bound(task_check.summarize, session, task)
+        if result.get("thumbnailPath"):
+            result["thumbnailUrl"] = f"http://{session.config.dwarf_ip}{result['thumbnailPath']}"
+            result["archiveUrl"] = scope_archive.transfer_url(session.config, result["thumbnailPath"])
+        return JSONResponse(result)
+
+    @app.get("/api/scope-archive/open/{dwarf_uid}")
+    async def api_scope_archive_open(dwarf_uid: str, media: str):
+        """The Program page's "Archive" button: Scope Archive's window when it
+        has one (opened=true), else the URL for the page to open in a tab.
+        The URL is rebuilt here from the device's settings, never taken from
+        the request."""
+        try:
+            session = get_manager().get(dwarf_uid)
+        except KeyError:
+            return JSONResponse({"opened": False, "url": None}, status_code=404)
+        url = scope_archive.transfer_url(session.config, media)
+        if not url:
+            return JSONResponse({"opened": False, "url": None})
+        opened = await run.io_bound(scope_archive.open_in_app, url)
+        return JSONResponse({"opened": opened, "url": url})
 
     @app.get("/api/sites")
     def api_sites():
@@ -454,6 +505,33 @@ def register_api_routes() -> None:
         except KeyError:
             return JSONResponse({"error": f"unknown dwarfUid {dwarf_uid!r}"}, status_code=404)
 
+        # The /catalog page's targets go into catalog_add_on.json
+        # (components/catalog_add_on.py) when the user ticked
+        # "saveToCatalog" - their "catalogMeta" is stripped either way
+        # before the schedule is stored or synced. Never blocks the send.
+        added: list[str] = []
+        try:
+            added = await run.io_bound(
+                catalog_add_on.add_from_schedule, schedule, bool(body.get("saveToCatalog"))
+            )
+            if added:
+                log.info(f"[{dwarf_uid}] Added to catalog_add_on.json: {', '.join(added)}")
+        except Exception as e:
+            log.error(f"[{dwarf_uid}] catalog_add_on.json update failed: {e}")
+            for task in schedule.get("shooting_tasks") or []:
+                if isinstance(task, dict):
+                    task.pop("catalogMeta", None)
+
+        # Device-confirmed (Oct 2026): a sync is only accepted less than
+        # 12 h before the schedule's start. Further out, keep it pending
+        # and let scheduler_loop.check_pending_schedules() send it in time.
+        if pending_schedules.is_too_early(schedule):
+            schedule["autoSync"] = True
+            pending_schedules.set_pending(dwarf_uid, schedule)
+            sync_at = pending_schedules.sync_opens_at(schedule)
+            log.info(f"[{dwarf_uid}] Schedule starts in more than 12 h — deferred, auto-sync from {sync_at}.")
+            return JSONResponse({"ok": True, "mode": "deferred", "syncAt": sync_at * 1000, "catalogAdded": added})
+
         if session.is_connected:
             # CONCURRENCY: don't fire CMD_SYNC_SHOOTING_SCHEDULE while
             # another command is in flight for this session - a manual
@@ -467,7 +545,7 @@ def register_api_routes() -> None:
             if not connection_health.try_acquire_command_slot(dwarf_uid, caller="api_routes.sync"):
                 log.info(f"[{dwarf_uid}] Busy (manual session or other command in flight) — queuing as pending instead of racing it.")
                 pending_schedules.set_pending(dwarf_uid, schedule)
-                return JSONResponse({"ok": True, "mode": "busy_pending"})
+                return JSONResponse({"ok": True, "mode": "busy_pending", "catalogAdded": added})
 
             log.info(f"[{dwarf_uid}] Sending shooting schedule now (device connected).")
             try:
@@ -476,7 +554,7 @@ def register_api_routes() -> None:
                 connection_health.release_command_slot(dwarf_uid)
             if ok:
                 pending_schedules.clear_pending(dwarf_uid)  # un envoi réussi rend l'attente obsolète
-                return JSONResponse({"ok": True, "mode": "sent"})
+                return JSONResponse({"ok": True, "mode": "sent", "catalogAdded": added})
             # User-requested (Sep 2026): "ce message m'intéresse plus
             # que... check the log" - the real DwarfErrorCode name
             # (e.g. "CODE_SHOOTING_SCHEDULE_TIME_CONFLICT") is now
@@ -492,7 +570,54 @@ def register_api_routes() -> None:
 
         log.info(f"[{dwarf_uid}] Device offline — storing schedule as pending.")
         pending_schedules.set_pending(dwarf_uid, schedule)
-        return JSONResponse({"ok": True, "mode": "pending"})
+        return JSONResponse({"ok": True, "mode": "pending", "catalogAdded": added})
+
+    def _native_mosaic_fields(body: dict):
+        """Parse the native-mosaic request fields.
+
+        The fields live ONLY in body["setup_camera"] (same layout as the saved
+        program file); anything at the root of the body is ignored.
+
+        framingX / framingY = size of the final capture in % of ONE tele frame
+        per axis: 100 = single frame on that axis (no mosaic along it),
+        180 = max (2 panels, 10% overlap). Panels = (X>100 ? 2 : 1) * (Y>100 ? 2 : 1).
+        mosaic_count = images PER panel, so total images = mosaic_count * panels.
+
+        Returns (fields, error). fields is None when no mosaic was requested.
+        """
+        src = body.get("setup_camera")
+        if not isinstance(src, dict):
+            return None, None
+
+        if not src.get("doMosaic"):
+            return None, None
+
+        try:
+            fx = int(src.get("framingX", 100))
+            fy = int(src.get("framingY", 100))
+        except (TypeError, ValueError):
+            return None, "framingX / framingY must be integers (100-180)"
+        if not (100 <= fx <= 180 and 100 <= fy <= 180):
+            return None, "framingX / framingY must be between 100 and 180"
+
+        try:
+            per_panel = int(src["mosaic_count"])
+        except KeyError:
+            return None, "mosaic_count is required when doMosaic is true"
+        except (TypeError, ValueError):
+            return None, "mosaic_count must be an integer"
+        if not (1 <= per_panel <= 249):
+            return None, "mosaic_count must be >= 1 and <= 249"
+
+        panels = (2 if fx > 100 else 1) * (2 if fy > 100 else 1)
+        return {
+            # both axes at 100 -> nothing to mosaic -> plain single-frame program
+            "doMosaic": panels > 1,
+            "framingX": fx,
+            "framingY": fy,
+            "mosaic_count": per_panel,
+            "panels": panels,
+        }, None
 
     @app.post("/api/program")
     async def api_program(request: Request):
@@ -528,12 +653,15 @@ def register_api_routes() -> None:
         if camera not in ("wide", "tele"):
             return JSONResponse({"error": "camera must be 'wide' or 'tele'"}, status_code=400)
 
-        program = _blank_program()
+        program = _blank_program(session.config)
         cmd = program["command"]
         cmd["id_command"]["description"] = name
-        cmd["id_command"]["date"] = body.get("date") or datetime.now().strftime("%Y-%m-%d")
+        # Defaults in the Dwarf's SITE time (components/site_time.py), the
+        # clock the scheduler checks programs against.
+        site_clock = site_now(session.config)
+        cmd["id_command"]["date"] = body.get("date") or site_clock.strftime("%Y-%m-%d")
         cmd["id_command"]["time"] = (
-            body.get("time") or (datetime.now() + timedelta(minutes=5)).strftime("%H:%M:%S")
+            body.get("time") or (site_clock + timedelta(minutes=5)).strftime("%H:%M:%S")
         )
 
         # Manual RA/Dec goto - a Milky Way mosaic tile (the driving use
@@ -571,9 +699,45 @@ def register_api_routes() -> None:
         active["gain"] = str(body.get("gain", active["gain"]))
         active["count"] = str(body.get("count", active["count"]))
         active["end_time"] = body.get("endTime", "")
+        # Absolute instants (optional, preferred): the sending page runs in
+        # the BROWSER's timezone, which in a remote setup (Tailscale from
+        # home...) isn't the site's - its "date"/"time"/"endTime" wall-
+        # clock strings would then be off by the difference. Converted
+        # here to the Dwarf's site time, the scheduler's clock.
+        start_epoch_ms = body.get("startEpochMs")
+        if start_epoch_ms is not None:
+            try:
+                start_site = site_from_timestamp(float(start_epoch_ms) / 1000, session.config)
+            except (TypeError, ValueError, OverflowError, OSError):
+                return JSONResponse({"error": "startEpochMs must be a number (ms since epoch)"}, status_code=400)
+            cmd["id_command"]["date"] = start_site.strftime("%Y-%m-%d")
+            cmd["id_command"]["time"] = start_site.strftime("%H:%M:%S")
+        end_epoch_ms = body.get("endEpochMs")
+        if end_epoch_ms is not None and active["end_time"]:
+            try:
+                active["end_time"] = site_from_timestamp(float(end_epoch_ms) / 1000, session.config).strftime("%H:%M")
+            except (TypeError, ValueError, OverflowError, OSError):
+                return JSONResponse({"error": "endEpochMs must be a number (ms since epoch)"}, status_code=400)
+        mosaic, mosaic_err = _native_mosaic_fields(body)
+        if mosaic_err:
+            return JSONResponse({"error": mosaic_err}, status_code=400)
+        if mosaic and camera != "tele":
+            return JSONResponse({"error": "native mosaic requires camera 'tele'"}, status_code=400)
+
         if camera == "tele":
             active["binning"] = str(body.get("binning", active.get("binning", "0")))
             active["ircut"] = str(body.get("ircut", active.get("ircut", "1")))
+            # Always write the four keys so a reused/blank program can never
+            # keep a stale doMosaic=True from a previous template.
+            active["doMosaic"] = bool(mosaic and mosaic["doMosaic"])
+            active["framingX"] = mosaic["framingX"] if mosaic else 100
+            active["framingY"] = mosaic["framingY"] if mosaic else 100
+            if mosaic:
+                active["mosaic_count"] = mosaic["mosaic_count"]
+                # Server is the authority on the total: count = per-panel x panels
+                # (client-sent count is ignored when doMosaic is true).
+                if mosaic["doMosaic"]:
+                    active["count"] = str(mosaic["mosaic_count"] * mosaic["panels"])
         cmd[inactive_key]["do_action"] = False
 
         # Always saved as a ToDo file first, START-NOW-or-not - see this
@@ -583,8 +747,7 @@ def register_api_routes() -> None:
         dirs = ensure_dirs(session)
         filename = _filename_for(program)
         filepath = os.path.join(dirs["TODO_DIR"], filename)
-        with open(filepath, "w", encoding="utf-8") as f:
-            json.dump(program, f, indent=4)
+        write_json_atomic(filepath, program)
         log.info(f"[{dwarf_uid}] Program saved: {filepath}")
 
         if not body.get("startNow"):
