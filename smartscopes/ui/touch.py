@@ -28,6 +28,11 @@ _CSS = r"""
   .q-expansion-item__container > .q-item .q-item__section--avatar .q-icon { font-size: 30px; }
   body { zoom: 1.1; }
 }
+@media (pointer: coarse) and (max-width: 699px) {
+  /* Phones: narrower icon buttons, so the dashboard's row of seven fits one line. */
+  .q-btn.q-btn--round { min-width: 36px; padding: 0; }
+  .q-btn--round .q-icon { font-size: 26px; }
+}
 @media (pointer: coarse) and (min-width: 700px) {
   body { zoom: 1.25; font-size: 20px; }
   /* Tablets have the room: larger sizes for the text the cards, hints,

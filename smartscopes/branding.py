@@ -62,6 +62,13 @@ def apply() -> None:
 
     ui.run = run
 
+    # The Dwarf page's header button for its programs: icon only, like its
+    # neighbours (the label made the row uneven and crowded on a phone).
+    from components import i18n  # upstream module; locales are cached dicts
+
+    for lang in i18n.SUPPORTED_LANGUAGES:
+        i18n._load_locale(lang)["open_programs"] = ""
+
     from components import pwa  # upstream module; the route serves this dict per request
 
     pwa._MANIFEST["name"] = APP_NAME

@@ -20,12 +20,15 @@ from smartscopes.programs import describe, list_programs, new_program, save_to_t
 from smartscopes.registry import all_models, get_driver_class
 
 
-def _header(title: str, back: str = "/") -> None:
+def _header(title: str, back: str = "/", settings: str | None = None) -> None:
     add_pwa_head_tags()
     apply_theme()
-    with ui.row().classes("items-center w-full"):
+    # no-wrap + min-w-0/truncate: a long name shortens instead of pushing the icons to a second row.
+    with ui.row().classes("items-center w-full no-wrap"):
         ui.button(icon="arrow_back", on_click=lambda: ui.navigate.to(back)).props("flat round")
-        ui.label(title).classes("text-xl grow")
+        ui.label(title).classes("text-xl grow min-w-0 truncate")
+        if settings:
+            ui.button(icon="settings", on_click=lambda: ui.navigate.to(settings)).props("flat round").tooltip("Settings")
         theme_toggle_button()
 
 
@@ -502,11 +505,8 @@ def build_pages() -> None:
         if device is None:
             _header("Unknown telescope")
             return
-        _header(f"{device.entry.name} · {device.driver.model.display_name}")
+        _header(f"{device.entry.name} · {device.driver.model.display_name}", settings=f"/scopes/{uid}/edit")
         with ui.column().classes("w-full max-w-3xl mx-auto gap-3 p-4"):
-            with ui.row().classes("w-full justify-end -mt-2"):
-                ui.button("Settings", icon="settings",
-                          on_click=lambda: ui.navigate.to(f"/scopes/{uid}/edit")).props("flat dense")
             _status_panel(device)
             _run_panel(device)
             _program_panel(device)
