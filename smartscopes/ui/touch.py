@@ -29,7 +29,17 @@ _CSS = """
   body { zoom: 1.1; }
 }
 @media (pointer: coarse) and (min-width: 700px) {
-  body { zoom: 1.25; }
+  body { zoom: 1.25; font-size: 16px; }
+  /* Tablets have the room: one step up for the small text sizes the cards,
+     hints and the log viewer use, and for panel titles and icons. "body"
+     only lifts these above Tailwind's own rules, which load later. */
+  body .text-xs { font-size: 0.875rem; line-height: 1.25rem; }
+  body .text-sm, body .md\:text-sm { font-size: 1rem; line-height: 1.5rem; }
+  body .md\:text-base { font-size: 1.125rem; line-height: 1.75rem; }
+  [style*="monospace"] { font-size: 15px !important; }
+  .q-btn .q-icon { font-size: 32px; }
+  .q-expansion-item__container > .q-item .q-item__label { font-size: 22px; }
+  .q-expansion-item__container > .q-item .q-item__section--avatar .q-icon { font-size: 36px; }
 }
 @media (pointer: coarse) and (min-width: 1000px) {
   body { zoom: 1.5; }
