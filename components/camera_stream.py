@@ -26,9 +26,11 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 
-from nicegui import ui
+from nicegui import run, ui
 
 from dwarf_python_api.lib.dwarf_session_socket import get_client_status
+
+import dwarf_python_api.lib.my_logger as log
 
 from components.i18n import t
 from components import rtsp_worker
@@ -251,6 +253,103 @@ def dashboard_thumbnail_refresh_source(session, image: ui.image, new_values: dic
     image.set_source(f"{url}?t={time.monotonic()}")
 
 
+# displaySource values (dwarf_python_api's PARAM_ID_ASTRO_DISPLAY_SOURCE):
+# 0 = last frame ("Single"), 1 = stacked image - from a capture of the
+# official app toggling it during a capture (Oct 2026).
+_DISPLAY_LAST_FRAME = 0
+_DISPLAY_STACKED = 1
+
+
+def _build_display_source_toggle(session, previews: list) -> None:
+    """Stacked image / last frame switch for the astro preview (user-
+    requested Oct 2026, the official app's own toggle): CMD_PARAM_SET_
+    GENERAL_INT_PARAM on the shared displaySource parameter. Control page
+    only. The current value is read once from the Dwarf's HTTP API
+    (getParamAndSetting, astro mode's shootingModeParams - no WebSocket
+    command); nothing is selected when it can't be read.
+
+    During a program it is sent while the run captures, without the
+    command slot (see scheduler_runner.program_capturing()); the click
+    takes priority over the periodic connection check (user-reported Oct
+    2026: an occasional "device busy" otherwise)."""
+    from dwarf_python_api.lib.dwarf_utils import perform_set_astro_display_source_v3
+    from components import connection_health
+
+    uid = session.dwarf_uid
+    with ui.row().classes("items-center gap-2 w-full"):
+        ui.label(t("display_source_label")).classes("text-sm text-grey-7")
+        toggle = ui.toggle(
+            {_DISPLAY_STACKED: t("display_source_stacked"), _DISPLAY_LAST_FRAME: t("display_source_last_frame")},
+            value=None,
+        ).props("dense no-caps")
+
+    previous = {"value": None}
+
+    async def _on_change(e) -> None:
+        value = e.value
+        if value is None or value == previous["value"]:
+            return
+        acquired = connection_health.acquire_with_priority(uid, caller="camera_stream.display_source")
+        if not acquired and not scheduler_runner.program_capturing(session):
+            ui.notify(t("device_busy"), type="warning")
+            toggle.set_value(previous["value"])
+            return
+        try:
+            result = await run.io_bound(perform_set_astro_display_source_v3, value, session=session)
+        finally:
+            if acquired:
+                connection_health.release_command_slot(uid)
+        if result is False:
+            ui.notify(t("command_failed"), type="negative")
+            toggle.set_value(previous["value"])
+            return
+        previous["value"] = value
+        # Show the new source right away, not at the next stacked frame
+        for preview in previews:
+            preview.image.set_source(f"{preview.url}?t={time.time()}")
+
+    toggle.on_value_change(_on_change)
+
+    attempts = {"left": 3}
+
+    async def _read_current() -> None:
+        """Current displaySource from the HTTP API, once the Dwarf is
+        connected (user-reported Oct 2026: never selected when the page
+        opened before the connection - it was read only once, 0.5 s
+        after the page opened). Skipped for a Dwarf II during a program:
+        HTTP polls during its capture crashed it in the field (see
+        pages/watch_device.py's skip_http_poll). No value in the
+        response (the parameter never set): the Dwarf shows the stacked
+        image, its default."""
+        from dwarf_python_api.get_config_data import config_to_dwarf_id_str
+        from dwarf_python_api.lib.dwarf_utils import perform_read_camera_params_http_v3
+
+        if previous["value"] is not None or attempts["left"] <= 0:
+            read_timer.deactivate()
+            return
+        if not session.is_connected or (
+            config_to_dwarf_id_str(session.config.dwarf_model_id) == "2" and scheduler_runner.is_running(uid)
+        ):
+            return  # tried again at the next tick
+        attempts["left"] -= 1
+        params = await run.io_bound(perform_read_camera_params_http_v3, 2, session=session)
+        if not isinstance(params, dict):
+            return  # read failed: next attempt
+        attempts["left"] = 0
+        value = (params.get("shooting_mode") or {}).get("displaySource")
+        log.debug(f"[{uid}] displaySource read from the HTTP API: {value!r}")
+        try:
+            value = _DISPLAY_STACKED if value in (None, "") else int(value)
+        except (TypeError, ValueError):
+            return
+        if value in (_DISPLAY_STACKED, _DISPLAY_LAST_FRAME) and previous["value"] is None:
+            previous["value"] = value  # set first: the change handler then sends nothing
+            toggle.set_value(value)
+
+    read_timer = ui.timer(2.0, _read_current)
+    ui.timer(0.5, _read_current, once=True)
+
+
 def build_camera_stream_section(session, show_links: bool = True) -> None:
     """Call once per page load. Tele and Wide each get their OWN
     ui.expansion (user-requested Sep 2026 - see _build_preview()'s own
@@ -332,12 +431,16 @@ def build_camera_stream_section(session, show_links: bool = True) -> None:
         for cfg in _CAMERAS
     ]
 
+    if show_links:
+        _build_display_source_toggle(session, previews)
+
     for preview in previews:
         def _on_expansion_change(e, preview=preview) -> None:
             if not e.value and preview.rtsp_started:
                 print(f"Stop RTSP: {preview.rtsp_url}")
-                rtsp_worker.stop_worker(preview.rtsp_url)
+                rtsp_worker.stop_worker(preview.rtsp_url, preview)
                 preview.rtsp_started = False
+                preview.rtsp_image.set_source("")
 
         preview.expansion.on_value_change(_on_expansion_change)
 
@@ -370,7 +473,7 @@ def build_camera_stream_section(session, show_links: bool = True) -> None:
         for preview in previews:
             if preview.rtsp_started:
                 print(f"Stop RTSP: {preview.rtsp_url}")
-                rtsp_worker.stop_worker(preview.rtsp_url)
+                rtsp_worker.stop_worker(preview.rtsp_url, preview)
                 preview.rtsp_started = False
 
     ui.context.client.on_disconnect(_stop_all_rtsp_workers)
@@ -387,8 +490,9 @@ def build_camera_stream_section(session, show_links: bool = True) -> None:
             for preview in previews:
                 if preview.rtsp_started:
                     print(f"Stop RTSP: {preview.rtsp_url}")
-                    rtsp_worker.stop_worker(preview.rtsp_url)
+                    rtsp_worker.stop_worker(preview.rtsp_url, preview)
                     preview.rtsp_started = False
+                    preview.rtsp_image.set_source("")
                     preview.rtsp_container.set_visibility(False)
                     preview.container.set_visibility(True)
             return
@@ -404,8 +508,9 @@ def build_camera_stream_section(session, show_links: bool = True) -> None:
                 # (no point refreshing a preview nobody can see).
                 if preview.rtsp_started:
                     print(f"Stop RTSP: {preview.rtsp_url}")
-                    rtsp_worker.stop_worker(preview.rtsp_url)
+                    rtsp_worker.stop_worker(preview.rtsp_url, preview)
                     preview.rtsp_started = False
+                    preview.rtsp_image.set_source("")
                 continue
 
             # Confirmed RTSP (1) -> embedded live preview.
@@ -418,9 +523,14 @@ def build_camera_stream_section(session, show_links: bool = True) -> None:
             preview.not_available_label.set_visibility(False)
             preview.rtsp_container.set_visibility(is_rtsp)
 
+            # A stopped preview clears its <img> source (above): it
+            # closes this page's own stream connection while other pages
+            # keep the shared worker running (rtsp_worker.py's holders),
+            # and makes the next start a real source change, so the
+            # browser reconnects instead of keeping a dead stream.
             if is_rtsp and not preview.rtsp_started:
                 print(f"Start RTSP : {preview.rtsp_url}")
-                rtsp_worker.start_worker(preview.rtsp_url)
+                rtsp_worker.start_worker(preview.rtsp_url, preview)
                 # Set once - this is a continuous multipart stream, not
                 # a snapshot, so it never needs cache-busting re-fetches
                 # like the HTTP preview below does (see rtsp_worker.py's
@@ -430,8 +540,9 @@ def build_camera_stream_section(session, show_links: bool = True) -> None:
                 preview.rtsp_started = True
             elif not is_rtsp and preview.rtsp_started:
                 print(f"Stop RTSP: {preview.rtsp_url}")
-                rtsp_worker.stop_worker(preview.rtsp_url)
+                rtsp_worker.stop_worker(preview.rtsp_url, preview)
                 preview.rtsp_started = False
+                preview.rtsp_image.set_source("")
 
             if not is_rtsp and preview.stack_field in new_values:
                 preview.image.set_source(f"{preview.url}?t={time.monotonic()}")
