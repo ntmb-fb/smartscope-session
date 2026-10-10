@@ -36,6 +36,7 @@ from nicegui import run, ui
 from dwarf_python_api.lib.dwarf_session import get_manager
 from dwarf_python_api.lib.dwarf_session_socket import get_client_status
 from dwarf_python_api.lib.dwarf_utils import perform_disconnect
+from dwarf_python_api.lib.dwarf_utils import perform_powerdown
 from dwarf_python_api.lib.dwarf_utils import perform_sync_shooting_schedule
 from dwarf_python_api.lib.dwarf_utils import perform_get_all_shooting_schedule_full
 from dwarf_python_api.lib.dwarf_utils import perform_get_last_connection_error
@@ -46,7 +47,7 @@ from dwarf_python_api.lib.my_logger import (
     unregister_thread_device_label,
 )
 
-from components import connection_health, scheduler_runner, native_schedule
+from components import connection_health, device_lock, scheduler_runner, native_schedule, scope_archive, task_check_cache
 from components.native_schedule import parse_native_schedule_info
 from components.actions_section import build_actions_section
 from components.camera_stream import build_camera_stream_section
@@ -55,6 +56,7 @@ from components.camera_settings import build_camera_settings
 from components.i18n import t
 from components.program_section import build_program_section
 from components.status_banner import status_banner
+from components.task_check import open_task_check
 from components.pwa import add_pwa_head_tags
 from components.theme import apply_theme
 
@@ -112,6 +114,39 @@ def _metric_card(label: str, value, unit: str, *, is_low: bool = False) -> None:
         ui.label(f"{value if value is not None else '\u2013'}{unit}").classes(
             "text-lg font-medium text-red-6 animate-pulse" if is_low else "text-lg font-medium"
         )
+
+
+# A closed page dialog is kept this long before being deleted: the
+# handler that closed it keeps running in its slot (command, then notify)
+_CLOSED_DIALOG_KEEP_S = 60.0
+# No view rebuild this long after a press on the page (see poll())
+_PRESS_QUIET_S = 1.5
+
+
+def _page_dialog() -> ui.dialog:
+    """A dialog attached to the page itself, not to the element that
+    opened it (user-reported Oct 2026: the Shut down confirmation vanished
+    after 2 s). Opened from session_view, a dialog was its child and the
+    2 s poll's session_view.refresh() deleted it.
+
+    Not deleted on close (user-reported Oct 2026: no notification after
+    Shut down): the confirm handler runs in the dialog's slot, and its
+    ui.notify() after the command failed silently once the dialog was
+    gone. Closed dialogs are deleted when a later one opens, once old
+    enough, so they don't pile up on the page."""
+    client = ui.context.client
+    closed = getattr(client, "_closed_page_dialogs", [])
+    now = time.monotonic()
+    for old, closed_at in list(closed):
+        if now - closed_at >= _CLOSED_DIALOG_KEEP_S:
+            closed.remove((old, closed_at))
+            if not old.is_deleted:
+                old.delete()
+    client._closed_page_dialogs = closed
+    with client.content:
+        dialog = ui.dialog()
+    dialog.on("hide", lambda: closed.append((dialog, time.monotonic())))
+    return dialog
 
 
 class _NullNotification:
@@ -200,7 +235,7 @@ async def _offer_pending_schedule_sync(session, dwarf_uid: str, pending: dict) -
     def _dismiss_only() -> None:
         dialog.close()
 
-    with ui.dialog() as dialog, ui.card():
+    with _page_dialog() as dialog, ui.card():
         ui.label(t("sched_pending_offer", name=name, count=n_tasks))
         with ui.row():
             ui.button(t("sched_sync_now"), on_click=_sync_now)
@@ -242,7 +277,7 @@ def _task_state_label(state: int) -> str:
     return t(key) if key else str(state)
 
 
-def _schedule_status_text(sc: dict) -> str:
+def _schedule_status_text(sc: dict, tz=None) -> str:
     """User-requested (Sep 2026): \"un texte dépendant de l'état : prévu
     date debut - fin, en cours, terminé et échec\". The device's own
     ShootingScheduleMsg carries this schedule's own start_time/end_time
@@ -253,8 +288,8 @@ def _schedule_status_text(sc: dict) -> str:
     completed/expired the plain state label already says what happened,
     the dates would be redundant with the per-task lines shown below."""
     if sc.get("state_code") == 1 and sc.get("startTime") and sc.get("endTime"):
-        start_dt = datetime.fromtimestamp(sc["startTime"])
-        end_dt = datetime.fromtimestamp(sc["endTime"])
+        start_dt = datetime.fromtimestamp(sc["startTime"], tz)
+        end_dt = datetime.fromtimestamp(sc["endTime"], tz)
         end_fmt = f"{end_dt:%H:%M}" if start_dt.date() == end_dt.date() else f"{end_dt:%Y-%m-%d %H:%M}"
         return t("sched_planned_range", start=f"{start_dt:%Y-%m-%d %H:%M}", end=end_fmt)
     return _schedule_state_label(sc["state_code"])
@@ -310,6 +345,26 @@ def _get_schedule_section_box(dwarf_uid: str) -> _BoolBox:
     return box
 
 
+def fmt_scale(v) -> str | None:
+    """180 -> "1.8", 140 -> "1.4", 1.8 -> "1.8" ; None si valeur invalide."""
+    try:
+        n = float(v)
+    except (TypeError, ValueError):
+        return None
+    if n <= 0:
+        return None
+    if n > 10:      # valeur en % (100-180) -> échelle (1.0-1.8)
+        n /= 100
+    return f"{n:.1f}"
+
+def mosaic_text(h, v, word: str = "Mosaic") -> str:
+    """mosaic_text(1.8, 1.4) -> "Mosaic 1.8 × 1.4 (4 panels)"; mosaic_text(140, 100) -> "Mosaic 1.4 × 1.0 (2 panels)"."""
+    a, b = fmt_scale(h), fmt_scale(v)
+    if not a or not b:
+        return ""
+    panels = (2 if float(a) > 1 else 1) * (2 if float(b) > 1 else 1)
+    return f"{word if panels > 1 else ""} {a} × {b}" + (f" ({panels} panels)" if panels > 1 else "")
+
 async def _handle_delete_schedule(
     session, dwarf_uid: str, schedule_id: str, schedule_name: str, refresh_view: Callable[[], None]
 ) -> None:
@@ -333,7 +388,7 @@ async def _handle_delete_schedule(
     ongoing_notification() fired, and apparently refresh_view() too.
     Simplified to match the other three handlers' working pattern.
     """
-    with ui.dialog() as dialog, ui.card():
+    with _page_dialog() as dialog, ui.card():
         ui.label(t("sched_delete_confirm", name=schedule_name)).classes("text-sm")
 
         async def _do_delete() -> None:
@@ -451,6 +506,11 @@ async def _handle_sync_pending(session, dwarf_uid: str, refresh_view: Callable[[
 
 
 async def _handle_connect(session, dwarf_uid: str, refresh_view: Callable[[], None]) -> None:
+    if device_lock.held_elsewhere(dwarf_uid):
+        _safe_notify(t("device_used_elsewhere"), type="warning")
+        return
+    # The user takes the Dwarf back (auto-reconnect resumes too)
+    connection_health.clear_taken_over(dwarf_uid)
     if not connection_health.try_acquire_command_slot(dwarf_uid, caller="session.connect"):
         _safe_notify(t("device_busy"), type="warning")
         return
@@ -486,7 +546,9 @@ async def _handle_connect(session, dwarf_uid: str, refresh_view: Callable[[], No
         _label_thread_for_device(session)
 
         pending = pending_schedules.get_pending(dwarf_uid)
-        if pending is not None:
+        # Too early (>12 h before start): the device would refuse it - the
+        # banner shows when it'll be synced instead of offering it now.
+        if pending is not None and not pending_schedules.is_too_early(pending):
             await _offer_pending_schedule_sync(session, dwarf_uid, pending)
     refresh_view()
 
@@ -505,11 +567,72 @@ async def _handle_disconnect(session, dwarf_uid: str, refresh_view: Callable[[],
     if thread is not None:
         unregister_thread_device_label(thread.ident)
     connection_health.forget(dwarf_uid)
+    # Lets another instance on this PC take this Dwarf
+    device_lock.release(dwarf_uid)
     connection_health.mark_manual_disconnect(dwarf_uid)  # <-- ADD: suppresses
         # auto_reconnect() until the user reconnects again themselves -
         # otherwise maybe_check() sees is_connected=False right after this
         # and immediately undoes the user's own Disconnect click.
     _safe_notify(t("disconnected"), type="warning")
+    refresh_view()
+
+
+async def _handle_shutdown(session, dwarf_uid: str, refresh_view: Callable[[], None]) -> None:
+    """Powers the Dwarf off after a confirmation (user-requested Oct 2026:
+    next to Disconnect, the Reboot of the actions section was the only way
+    and was clicked instead)."""
+    with _page_dialog() as dialog, ui.card():
+        ui.label(t("shutdown_confirm"))
+        with ui.row().classes("w-full justify-end gap-2 mt-2"):
+            ui.button(t("cancel"), on_click=dialog.close).props("flat")
+
+            async def _confirmed() -> None:
+                dialog.close()
+                await _shutdown(session, dwarf_uid, refresh_view)
+
+            ui.button(t("shutdown_confirm_button"), icon="power_settings_new",
+                      on_click=_confirmed).props("color=negative")
+    dialog.open()
+
+
+async def _shutdown(session, dwarf_uid: str, refresh_view: Callable[[], None]) -> None:
+    # Priority over the periodic health check, as actions_section's
+    # _run_and_notify()
+    connection_health.mark_priority_pending(dwarf_uid)
+    try:
+        acquired = connection_health.try_acquire_command_slot(dwarf_uid, caller="session.shutdown")
+    finally:
+        connection_health.clear_priority_pending(dwarf_uid)
+    if not acquired:
+        _safe_notify(t("device_busy"), type="warning")
+        return
+    _busy_uids.add(dwarf_uid)
+    _safe_notify(t("shutdown_in_progress"))
+    thread = getattr(session, "event_loop_thread", None)
+    try:
+        # perform_powerdown() returns True on success, None otherwise
+        result = await run.io_bound(perform_powerdown, session=session)
+        if result is True:
+            # The Dwarf drops the connection while powering off: close
+            # ours too, so nothing waits on a dead socket
+            try:
+                await run.io_bound(perform_disconnect, session=session)
+            except Exception:
+                pass
+    finally:
+        _busy_uids.discard(dwarf_uid)
+        connection_health.release_command_slot(dwarf_uid)
+    if result is not True:
+        _safe_notify(t("shutdown_failed"), type="negative")
+        return
+    if thread is not None:
+        unregister_thread_device_label(thread.ident)
+    # Same as a manual Disconnect: no auto-reconnect to a powered-off
+    # Dwarf, and another instance on this PC may take it once back on
+    connection_health.forget(dwarf_uid)
+    device_lock.release(dwarf_uid)
+    connection_health.mark_manual_disconnect(dwarf_uid)
+    _safe_notify(t("shutdown_sent"), type="positive")
     refresh_view()
 
 
@@ -578,18 +701,24 @@ def build_session_page() -> None:
             # pattern already used for dwarf_model_id in scheduler_
             # runner.py. Degrades to simply not showing these links
             # rather than crashing the whole session page.
-            dwarfium_base_url = getattr(_header_session.config, "dwarfium_base_url", "") if _header_session else ""
-            dwarfium_id = getattr(_header_session.config, "dwarfium_id", "") if _header_session else ""
-            if dwarfium_base_url and dwarfium_id:
-                base = dwarfium_base_url.rstrip("/")
-                did = dwarfium_id
-                with ui.row().classes("items-center gap-3 -mt-1"):
-                    ui.link(t("open_in_dwarfium_config"), f"{base}/Dwarf?DwarfId={did}", new_tab=True).classes(
-                        "text-xs"
-                    )
-                    ui.link(
-                        t("open_in_dwarfium_explore"), f"{base}/Explore/?DwarfId={did}", new_tab=True
-                    ).classes("text-xs")
+            # In Scope Archive's own window when it runs as an app, else a
+            # browser tab (user-requested Oct 2026 - see scope_archive.py)
+            _header_config = _header_session.config if _header_session else None
+            scope_links = [
+                (t(key), scope_archive.page_url(_header_config, page))
+                for key, page in (
+                    ("open_scope_config", "config"),
+                    ("open_scope_explore_dwarf", "explore_dwarf"),
+                    ("open_scope_explore_backup", "explore_backup"),
+                )
+            ]
+            if all(url for _label, url in scope_links):
+                with ui.row().classes("items-center gap-1 -mt-1"):
+                    ui.label(t("open_scope_label")).classes("text-xs text-grey-7")
+                    for label, url in scope_links:
+                        ui.button(label, on_click=lambda _, u=url: scope_archive.open_page(u)).props(
+                            "flat dense no-caps size=sm color=primary"
+                        ).classes("text-xs")
 
             # Defined HERE, inside the page function, not at module
             # level - see the module docstring for why: this gives THIS
@@ -698,7 +827,9 @@ def build_session_page() -> None:
                         # now always shows when something is pending;
                         # only "Sync now" itself still needs the device
                         # connected and idle.
-                        can_sync_now = connected and not program_running and not capturing
+                        too_early = pending_schedules.is_too_early(pending_sched)
+                        expired = pending_schedules.is_expired(pending_sched)
+                        can_sync_now = connected and not program_running and not capturing and not too_early and not expired
                         with ui.row().classes("items-center gap-2 w-full"):
                             ui.icon("schedule").classes("text-amber-6")
                             ui.label(
@@ -708,6 +839,14 @@ def build_session_page() -> None:
                                     count=len(pending_sched.get("shooting_tasks", [])),
                                 )
                             ).classes("text-sm flex-1")
+                            if expired:
+                                ui.label(t("sched_expired")).classes("text-xs text-negative")
+                            elif too_early:
+                                opens_at = datetime.fromtimestamp(
+                                    pending_schedules.sync_opens_at(pending_sched),
+                                    native_schedule.schedule_tz(session.config),
+                                )
+                                ui.label(t("sched_auto_sync_at", time=f"{opens_at:%Y-%m-%d %H:%M}")).classes("text-xs text-grey-6")
                             if can_sync_now:
                                 ui.button(
                                     t("sched_sync_now"),
@@ -738,6 +877,14 @@ def build_session_page() -> None:
                                 t("disconnect"),
                                 icon="link_off",
                                 on_click=lambda: _handle_disconnect(
+                                    session, dwarf_uid, refresh_view_and_camera_settings
+                                ),
+                            ).props("flat color=negative")
+                            ui.space()
+                            ui.button(
+                                t("shutdown"),
+                                icon="power_settings_new",
+                                on_click=lambda: _handle_shutdown(
                                     session, dwarf_uid, refresh_view_and_camera_settings
                                 ),
                             ).props("flat color=negative")
@@ -878,6 +1025,10 @@ def build_session_page() -> None:
                 with ui.card().classes("w-full p-0"), ui.expansion(
                     t("sched_section_title"), icon="event_note",
                 ).classes("w-full").bind_value(_get_schedule_section_box(dwarf_uid), "value"):
+                    # Same timezone the schedule editor used to type these
+                    # times in, so a synced task reads back at the hour it
+                    # was entered (None = this PC's local time).
+                    sched_tz = native_schedule.schedule_tz(actions_session.config) if actions_session is not None else None
                     last_fetch = _schedules_last_fetch.get(dwarf_uid)
                     if last_fetch:
                         ui.label(
@@ -896,7 +1047,7 @@ def build_session_page() -> None:
                         for sc in cached_scheds[:shown]:
                             with ui.card().classes("w-full q-pa-sm q-mb-xs"):
                                 with ui.row().classes("w-full items-center gap-2"):
-                                    ui.label(f"{sc['name']} — {_schedule_status_text(sc)}").classes("font-medium text-sm flex-1")
+                                    ui.label(f"{sc['name']} — {_schedule_status_text(sc, sched_tz)}").classes("font-medium text-sm flex-1")
                                     ui.button(
                                         icon="delete",
                                         on_click=lambda _, sid=sc["scheduleId"], sname=sc["name"]: _handle_delete_schedule(
@@ -906,10 +1057,10 @@ def build_session_page() -> None:
                                 for tsk in sc["tasks"]:
                                     detail_bits = []
                                     if tsk.get("startTime"):
-                                        dt = datetime.fromtimestamp(tsk["startTime"])
+                                        dt = datetime.fromtimestamp(tsk["startTime"], sched_tz)
                                         detail_bits.append(f"[{dt:%Y-%m-%d %H:%M}")
                                     if tsk.get("endTime"):
-                                        dt = datetime.fromtimestamp(tsk["endTime"])
+                                        dt = datetime.fromtimestamp(tsk["endTime"], sched_tz)
                                         detail_bits.append(f" - {dt:%H:%M}]")
                                     if tsk.get("shutterName"):
                                         detail_bits.append(f"{tsk['shutterName']}s")
@@ -917,6 +1068,8 @@ def build_session_page() -> None:
                                         detail_bits.append(f"gain {tsk['gainName']}")
                                     if tsk.get("filterModeName"):
                                         detail_bits.append(tsk["filterModeName"])
+                                    if tsk.get("isMosaic"):
+                                        detail_bits.append(f"Mosaic {fmt_scale(tsk['horizontalScale'])} x {fmt_scale(tsk['verticalScale'])}")
                                     # count/stacked deliberately NOT shown
                                     # (user-reported Sep 2026, confirmed by
                                     # a real screenshot: always "0 imgs /
@@ -927,10 +1080,46 @@ def build_session_page() -> None:
                                     # as the combined /Program page's own
                                     # native task rendering).
                                     detail = " · ".join(str(b) for b in detail_bits if b)
-                                    line = f"• {tsk['name']}: {_task_state_label(tsk['state_code'])}"
+                                    warning = native_schedule.is_warning(tsk)
+                                    if warning:
+                                        # Error -1: a warning, not a failure (stack usually saved)
+                                        line = f"• {tsk['name']}: \u26a0 {t('sched_task_warning')}"
+                                    else:
+                                        line = f"• {tsk['name']}: {_task_state_label(tsk['state_code'])}"
+                                    if tsk.get("error_code") and not warning:
+                                        line += f" [{tsk['error_code']} {tsk.get('error_name') or ''}]".replace(" ]", "]")
+                                    # Counts found by an earlier View / Check
+                                    shots = task_check_cache.shots_text(
+                                        task_check_cache.get(dwarf_uid, tsk), t("prog_shots_stacked")
+                                    )
+                                    if shots:
+                                        line += f" \u00b7 {shots}"
                                     if detail:
                                         line += f" ({detail})"
-                                    ui.label(line).classes("text-xs text-grey-7")
+                                    failed = bool(tsk.get("error_code")) or tsk.get("state_code") in (3, 4)
+                                    if failed or tsk.get("state_code") == 2:
+                                        # What the Dwarf saved: "Check" on a failed / interrupted
+                                        # task (red, orange for a warning), "View" on a successful
+                                        # one (blue) - its data and stacked image at a glance
+                                        if not failed:
+                                            label, icon, color = t("task_view"), "image", "primary"
+                                        else:
+                                            label, icon = t("task_check"), "fact_check"
+                                            color = "warning" if warning else "negative"
+                                        with ui.row().classes("w-full items-center gap-1 no-wrap"):
+                                            ui.label(line).classes(
+                                                f"text-xs flex-1 {'text-warning' if warning else 'text-grey-7'}"
+                                            )
+                                            ui.button(
+                                                label,
+                                                icon=icon,
+                                                on_click=lambda _, task=tsk: open_task_check(
+                                                    actions_session, task, make_dialog=_page_dialog,
+                                                    on_result=shooting_schedule_view.refresh,
+                                                ),
+                                            ).props(f"flat dense no-caps size=sm color={color}")
+                                    else:
+                                        ui.label(line).classes("text-xs text-grey-7")
                         if len(cached_scheds) > shown:
                             ui.button(
                                 t("sched_show_more", count=len(cached_scheds) - shown),
@@ -947,6 +1136,18 @@ def build_session_page() -> None:
                     ).props("dense flat")
 
             shooting_schedule_view()
+
+            # Counts kept by a View / Check run elsewhere (Program page,
+            # another tab): this list is built once, so it follows the
+            # cache's version instead of waiting for a reload
+            seen_check_version = [task_check_cache.version()]
+
+            def _follow_task_checks() -> None:
+                if task_check_cache.version() != seen_check_version[0]:
+                    seen_check_version[0] = task_check_cache.version()
+                    shooting_schedule_view.refresh()
+
+            ui.timer(3.0, _follow_task_checks)
 
             # Program (scheduler): also built once, not on the 2s poll -
             # it holds its own upload widget + a running program's live
@@ -966,6 +1167,20 @@ def build_session_page() -> None:
                 session_view.refresh()
                 refresh_camera_settings()
 
+            # Clicks sometimes ignored (user-reported Oct 2026): the poll
+            # rebuilds session_view every 2 s, and a click landing during
+            # a rebuild hit a button just replaced (pressed on the old
+            # one, released on the new one, or its event reaching the
+            # server after the old one was deleted). The page reports
+            # each press, and the poll doesn't rebuild the view right
+            # after one.
+            last_press = [0.0]
+            ui.on("adss_press", lambda: last_press.__setitem__(0, time.monotonic()))
+            ui.add_body_html(
+                "<script>for (const name of ['pointerdown', 'pointerup']) "
+                "document.addEventListener(name, () => emitEvent('adss_press'), true);</script>"
+            )
+
             async def poll() -> None:
                 if dwarf_uid in _busy_uids:
                     return
@@ -974,6 +1189,8 @@ def build_session_page() -> None:
                 except KeyError:
                     return
                 await connection_health.maybe_check(session)
+                if time.monotonic() - last_press[0] < _PRESS_QUIET_S:
+                    return
                 session_view.refresh()
 
                 # Hide Camera Settings while a program is actively

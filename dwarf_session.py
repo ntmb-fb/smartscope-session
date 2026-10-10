@@ -2,6 +2,8 @@ import json
 import time
 from datetime import datetime, timedelta
 
+from components.site_time import session_now
+
 from dwarf_python_api.lib.dwarf_utils import perform_GoLive
 from dwarf_python_api.lib.dwarf_utils import perform_enter_astro_mode
 from dwarf_python_api.lib.dwarf_utils import perform_enter_shooting_mode
@@ -13,8 +15,7 @@ from dwarf_python_api.lib.dwarf_utils import perform_calibration
 from dwarf_python_api.lib.dwarf_utils import perform_goto
 from dwarf_python_api.lib.dwarf_utils import perform_stop_goto
 from dwarf_python_api.lib.dwarf_utils import perform_goto_stellar
-from dwarf_python_api.lib.dwarf_utils import parse_ra_to_float
-from dwarf_python_api.lib.dwarf_utils import parse_dec_to_float
+from components.coords import parse_dec_degrees, parse_ra_hours
 from dwarf_python_api.lib.dwarf_utils import perform_takeAstroPhoto
 from dwarf_python_api.lib.dwarf_utils import perform_continue_shooting
 from dwarf_python_api.lib.dwarf_utils import perform_clear_needs_continue_shooting
@@ -115,7 +116,7 @@ STEP_DESCRIPTIONS = {
     "step_16": "Stop Tele and Wide Astro photo Session",
 }
 
-def _parse_end_time(value):
+def _parse_end_time(value, session=None):
     """'HH:MM' (24h, program_editor.py's prog_end_time field) -> a
     datetime for the NEXT occurrence of that clock time, or None if
     blank/unset/unparseable.
@@ -127,13 +128,17 @@ def _parse_end_time(value):
     instead. Without this, the very first check in
     _wait_for_astro_end() below would see an already-past deadline and
     stop the capture almost immediately, instead of after actually
-    crossing midnight."""
+    crossing midnight.
+
+    Site time (components/site_time.py): end_time is wall-clock time at
+    the Dwarf's site, like the program's own start date/time."""
     if not value:
         return None
     try:
         hour, minute = str(value).strip().split(":")
-        candidate = datetime.now().replace(hour=int(hour), minute=int(minute), second=0, microsecond=0)
-        if candidate <= datetime.now():
+        now = session_now(session)
+        candidate = now.replace(hour=int(hour), minute=int(minute), second=0, microsecond=0)
+        if candidate <= now:
             candidate += timedelta(days=1)
         return candidate
     except (ValueError, AttributeError):
@@ -216,7 +221,7 @@ def _wait_for_astro_end(stop_fn, end_time, interrupted, session, camera_type="Te
         if status and not status.get("capturing"):
             return True
 
-        if end_time is not None and datetime.now() >= end_time:
+        if end_time is not None and session_now(session) >= end_time:
             log.notice(
                 f"Reached scheduled end time ({end_time:%H:%M}) - image count not finished, stopping capture now"
             )
@@ -355,7 +360,7 @@ def start_dwarf_session(program, stop_event=None, session=None, progress_callbac
             binning_val = str(program['setup_camera'].get('binning', "0"))
             IR_val = str(program['setup_camera'].get('ircut', "0"))
             count_val = str(program['setup_camera'].get('count', "0"))
-            end_time_val = _parse_end_time(program['setup_camera'].get('end_time', ''))
+            end_time_val = _parse_end_time(program['setup_camera'].get('end_time', ''), session)
 
             # Mosaic (tele-only, user-requested Sep 2026): a sub-section
             # of the tele capture settings, backward-compatible -
@@ -404,7 +409,7 @@ def start_dwarf_session(program, stop_event=None, session=None, progress_callbac
             wide_exp_val = str(program['setup_wide_camera'].get('exposure', "0"))
             wide_gain_val = str(program['setup_wide_camera'].get('gain', "0"))
             wide_count_val = str(program['setup_wide_camera'].get('count', "0"))  # Fix: use separate variable
-            wide_end_time_val = _parse_end_time(program['setup_wide_camera'].get('end_time', ''))
+            wide_end_time_val = _parse_end_time(program['setup_wide_camera'].get('end_time', ''), session)
 
             if wide_exp_val or wide_gain_val or wide_count_val:
                 log.notice(f" To do => Astro Wide Photo with these parameters")
@@ -642,15 +647,14 @@ def start_dwarf_session(program, stop_event=None, session=None, progress_callbac
         if goto_manual:
             target_name = program.get('goto_manual', {}).get('target')
             log.notice(f"Processing Goto : {target_name}")
-            try:
-                decimal_RA = float(manual_RA)
-            except ValueError:
-                decimal_RA = parse_ra_to_float(manual_RA)
-
-            try:
-                decimal_Dec = float(manual_declination)
-            except ValueError:
-                decimal_Dec = parse_dec_to_float(manual_declination)
+            # Decimal or sexagesimal, any usual notation (components/coords.py:
+            # the library's parsers only knew "HH:MM:SS" and dropped the Dec
+            # sign on minutes / seconds)
+            decimal_RA = parse_ra_hours(manual_RA)
+            decimal_Dec = parse_dec_degrees(manual_declination)
+            if decimal_RA is None or decimal_Dec is None:
+                log.error(f"Goto {target_name}: unreadable coordinates RA={manual_RA!r} Dec={manual_declination!r}")
+                verify_action(False, "step_9", progress_callback=progress_callback)  # raises
 
             continue_action = perform_goto(decimal_RA, decimal_Dec, target_name, session=session)
             if interrupted(): return
