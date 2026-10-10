@@ -5,8 +5,9 @@ live by scheduler_runner.py from this PC, one command at a time). This
 one lives ON the device once synced - it keeps running even if this app,
 or the PC, disconnects or shuts down.
 
-Reuses program_editor.py's target-input approach (Stellarium fetch +
-manual RA/Dec) and camera_settings.py's exposure/gain/IR-filter tables -
+Reuses program_editor.py's target-input approach (Stellarium fetch,
+DSO catalog shared with Dwarfium Scope Archive, manual RA/Dec, altitude
+chart / best slot - components/target_planner.py) and camera_settings.py's exposure/gain/IR-filter tables -
 not reinvented.
 
 CONFIRMED PROTOCOL LIMITS (dwarf_python_api/proto/shooting_schedule.proto
@@ -40,39 +41,92 @@ editor.py is deliberately ABSENT here, not an oversight:
 """
 from __future__ import annotations
 
-import math
 import uuid
+import time
 from datetime import datetime, timedelta, timezone
 
 from nicegui import run, ui
 
-from components import connection_health
+import pending_schedules
+from components import connection_health, native_schedule
 from components.camera_settings import _exposure_names, _gain_range, _GAIN_STEP, _ir_filter_names
 from components.datetime_picker import date_picker_input, time_picker_input
 from components.i18n import t
+from components.native_schedule import schedule_tz
+from components.dso_catalog import short_name
 from components.stellarium import get_target_from_stellarium
+from components.target_planner import build_altitude_panel, earliest_start, night_of, open_catalog_dialog
+import dwarf_python_api.lib.my_logger as log
 from dwarf_python_api.get_config_data import config_to_dwarf_id_str
-from dwarf_python_api.lib.dwarf_utils import perform_sync_shooting_schedule
+from dwarf_python_api.lib.dwarf_utils import perform_get_all_shooting_schedule_full, perform_sync_shooting_schedule
 
 
-def _exposure_seconds(name: str) -> float | None:
-    """Parses an exposure name from _exposure_names() (e.g. "1/50",
-    "0.4", "60") into a plain float number of seconds. Returns None for
-    anything unparseable rather than raising, so a caller can fall back
-    to a safe default instead of crashing the UI on an unexpected name.
-    """
-    if not name:
-        return None
+# Device-tested (Oct 2026): tasks must not overlap - two targets starting
+# the same minute were merged by the Dwarf into one uncontrollable run.
+# A few minutes apart is accepted; 5 min also leaves time to slew and
+# calibrate (same gap as js/dwarf-scheduler.js's _DWARF_TASK_GAP_MS).
+TASK_GAP_MIN = 5
+
+# The Dwarf's schedule list is read again when the editor opens if the
+# cached copy is older than this (see build_schedule_editor()).
+_DEVICE_LIST_MAX_AGE_S = 10 * 60
+
+
+def _duration_min(start_hhmm: str, end_hhmm: str) -> int | None:
+    """Minutes from start to end time (an end at or before the start is
+    the next day, e.g. 22:00 -> 02:30), None if a time is unparseable."""
     try:
-        if "/" in name:
-            numerator, denominator = name.split("/", 1)
-            return float(numerator) / float(denominator)
-        return float(name)
-    except (ValueError, ZeroDivisionError):
+        start = datetime.strptime(start_hhmm.strip(), "%H:%M")
+        end = datetime.strptime(end_hhmm.strip(), "%H:%M")
+    except (ValueError, AttributeError):
         return None
+    minutes = int((end - start).total_seconds() // 60)
+    if minutes == 0:
+        return None  # same time: no window
+    return minutes if minutes > 0 else minutes + 24 * 60
 
 
-def _new_task_defaults(dwarf_type: str) -> dict:
+def next_free_start(
+    earliest: datetime, duration_min: int, busy: list[tuple[datetime, datetime]]
+) -> datetime:
+    """First start >= earliest (whole minute) where a task of duration_min
+    keeps TASK_GAP_MIN from every busy (start, end) window - i.e. after
+    the end of the task running then and of those chained right after
+    it (user-requested Oct 2026)."""
+    gap = timedelta(minutes=TASK_GAP_MIN)
+    candidate = earliest.replace(second=0, microsecond=0)
+    if candidate < earliest:
+        candidate += timedelta(minutes=1)
+    length = timedelta(minutes=duration_min)
+    moved = True
+    while moved:
+        moved = False
+        for start, end in sorted(busy):
+            if candidate < end + gap and start < candidate + length + gap:
+                candidate = end + gap
+                moved = True
+    return candidate
+
+
+def _task_window(tk: dict) -> tuple[datetime, datetime]:
+    """Naive local start/end of an editor task (all tasks share one tz)."""
+    start = datetime.strptime(f"{tk['date']} {tk['startTime']}", "%Y-%m-%d %H:%M")
+    return start, start + timedelta(minutes=int(tk["durationMin"]))
+
+
+def _find_conflict(new_tk: dict, existing: list[dict]) -> dict | None:
+    """First existing task closer than TASK_GAP_MIN to `new_tk` (overlap
+    included), or None."""
+    gap = timedelta(minutes=TASK_GAP_MIN)
+    new_start, new_end = _task_window(new_tk)
+    for tk in existing:
+        start, end = _task_window(tk)
+        if new_start < end + gap and start < new_end + gap:
+            return tk
+    return None
+
+
+def _new_task_defaults(dwarf_type: str, tz) -> dict:
     exposures = _exposure_names("tele", dwarf_type)
     filters = _ir_filter_names(dwarf_type)
     gain_min, _gain_max = _gain_range("tele")
@@ -83,13 +137,12 @@ def _new_task_defaults(dwarf_type: str) -> dict:
         "shutterName": exposures[-3] if exposures else "",
         "gainName": str(gain_min),
         "filterModeName": filters[0] if filters else "",
-        "count": 20,
         "mosaic": False,
         "horizontalScale": 1.0,
         "verticalScale": 1.0,
-        "date": datetime.now().strftime("%Y-%m-%d"),
-        "startTime": (datetime.now() + timedelta(minutes=5)).strftime("%H:%M"),
-        "durationMin": 60,
+        "date": (datetime.now(tz) + timedelta(minutes=10)).strftime("%Y-%m-%d"),
+        "startTime": (datetime.now(tz) + timedelta(minutes=10)).strftime("%H:%M"),
+        "endTime": (datetime.now(tz) + timedelta(minutes=70)).strftime("%H:%M"),
     }
 
 
@@ -108,12 +161,101 @@ def build_schedule_editor(session) -> None:
 
     ui.label(t("sched_add_target")).classes("text-sm text-grey-6 mt-2")
 
-    draft = _new_task_defaults(dwarf_type)
+    # Every date/time typed here is wall-clock time in the DEVICE's
+    # configured timezone - defaults, "Now + 10min" and the UTC conversion
+    # in _build_wire_tasks() all use this same tz, so they can't disagree
+    # when this PC runs in another timezone than the device's site.
+    user_tz = schedule_tz(session.config)
+    draft = _new_task_defaults(dwarf_type, user_tz)
 
-    with ui.row().classes("w-full gap-2"):
-        target_name_input = ui.input(t("prog_target_name"), value=draft["name"]).classes("flex-1")
-        ra_input = ui.input(t("prog_ra"), value=draft["ra"]).classes("w-32")
-        dec_input = ui.input(t("prog_dec"), value=draft["dec"]).classes("w-32")
+    # Reminder of what is already planned ON THE DWARF (user-requested Oct
+    # 2026): its upcoming / running native schedule tasks, from the last
+    # read of its list - so a new target can be fitted around them, and
+    # _add_task() refuses one that would overlap them.
+    def _device_windows() -> list[tuple[datetime, datetime, str]]:
+        """Upcoming device tasks as naive device-tz (start, end, name)."""
+        windows = []
+        for tk in native_schedule.upcoming_tasks(dwarf_uid):
+            start = datetime.fromtimestamp(tk["start"], user_tz).replace(tzinfo=None)
+            end = datetime.fromtimestamp(tk["end"], user_tz).replace(tzinfo=None)
+            windows.append((start, end, tk["name"]))
+        return windows
+
+    with ui.card().classes("w-full p-2 gap-1"):
+        with ui.row().classes("w-full items-center justify-between"):
+            ui.label(t("sched_on_device")).classes("text-sm font-medium")
+            device_refresh_button = ui.button(t("sched_refresh"), icon="refresh").props("flat dense no-caps")
+
+        @ui.refreshable
+        def _render_device_schedules() -> None:
+            upcoming = native_schedule.upcoming_tasks(dwarf_uid)
+            fetched_at = native_schedule.get_cached_fetched_at(dwarf_uid)
+            if not upcoming:
+                ui.label(t("sched_on_device_none")).classes("text-xs text-grey-6")
+            for tk in upcoming:
+                start = datetime.fromtimestamp(tk["start"], user_tz)
+                end = datetime.fromtimestamp(tk["end"], user_tz)
+                running = tk["state_code"] == 1 or start.timestamp() <= time.time()
+                state = t("sched_state_shooting") if running else t("sched_state_pending")
+                with ui.row().classes("items-center gap-2 no-wrap"):
+                    ui.icon("play_circle" if running else "event").classes(
+                        "text-sm " + ("text-positive" if running else "text-grey-6")
+                    )
+                    ui.label(
+                        f"{tk['name']} \u2014 {start:%d/%m %H:%M}\u2013{end:%H:%M} \u00b7 {state}"
+                        + (f" \u00b7 {tk['schedule']}" if tk["schedule"] else "")
+                    ).classes("text-xs")
+            if fetched_at:
+                ui.label(t("sched_on_device_read_at", time=f"{datetime.fromtimestamp(fetched_at):%d/%m %H:%M}")).classes(
+                    "text-xs text-grey-5"
+                )
+
+        _render_device_schedules()
+
+    async def _refresh_device_schedules(quiet: bool = False) -> None:
+        """Reads the Dwarf's schedule list (same command as the device
+        page's own Refresh) and updates the reminder and the chart.
+        quiet: automatic read - no message when it can't be done, the
+        cached list simply stays."""
+        if not session.is_connected:
+            if not quiet:
+                ui.notify(t("disconnected"), type="warning")
+            return
+        if not connection_health.try_acquire_command_slot(dwarf_uid, caller="schedule_editor.refresh"):
+            if not quiet:
+                ui.notify(t("device_busy"), type="warning")
+            return
+        try:
+            info = await run.io_bound(perform_get_all_shooting_schedule_full, session=session)
+        finally:
+            connection_health.release_command_slot(dwarf_uid)
+        if info is None:
+            if not quiet:
+                ui.notify(t("sched_read_error"), type="negative")
+            return
+        native_schedule.set_cached(dwarf_uid, native_schedule.parse_native_schedule_info(info))
+        _render_device_schedules.refresh()
+        _refresh_altitude_chart()
+        if not tasks:
+            _set_next_free_slot()
+
+    device_refresh_button.on_click(lambda: _refresh_device_schedules())
+
+    # Cached list missing or older than _DEVICE_LIST_MAX_AGE_S: read it
+    # from the Dwarf once when the editor opens (user-requested Oct 2026),
+    # instead of waiting for a Refresh click.
+    fetched_at = native_schedule.get_cached_fetched_at(dwarf_uid)
+    if fetched_at is None or time.time() - fetched_at > _DEVICE_LIST_MAX_AGE_S:
+        ui.timer(0.5, lambda: _refresh_device_schedules(quiet=True), once=True)
+
+    # min-w on the name: on a phone it wraps onto its own full-width line
+    # instead of being squeezed to a few characters; RA/Dec (~9 chars each)
+    # stay together on the next line.
+    with ui.row().classes("w-full gap-2 flex-wrap"):
+        target_name_input = ui.input(t("prog_target_name"), value=draft["name"]).classes("flex-1 min-w-[240px]")
+        with ui.row().classes("gap-2 no-wrap"):  # RA/Dec wrap together
+            ra_input = ui.input(t("prog_ra"), value=draft["ra"]).classes("w-24")
+            dec_input = ui.input(t("prog_dec"), value=draft["dec"]).classes("w-24")
 
     stellarium_status = ui.label("").classes("text-xs")
 
@@ -135,15 +277,30 @@ def build_schedule_editor(session) -> None:
         dec_input.value = str(target.dec_degrees)
         stellarium_status.set_text(t("prog_stellarium_fetched", name=target.target_name))
         stellarium_status.classes(replace="text-xs text-green-700")
+        _refresh_altitude(open_panel=True)
 
-    ui.button(t("prog_get_from_stellarium"), icon="explore", on_click=_fetch_from_stellarium).props("flat dense")
+    def _apply_catalog_entry(entry: dict) -> None:
+        name = short_name(entry)
+        target_name_input.value = name
+        ra_input.value = f"{entry['ra_hours']:.6f}"
+        dec_input.value = f"{entry['dec_deg']:.6f}"
+        stellarium_status.set_text(t("prog_stellarium_fetched", name=name))
+        stellarium_status.classes(replace="text-xs text-green-700")
+        _refresh_altitude(open_panel=True)
+
+    with ui.row().classes("gap-2"):
+        ui.button(t("prog_get_from_stellarium"), icon="explore", on_click=_fetch_from_stellarium).props("flat dense")
+        ui.button(
+            t("prog_pick_from_catalog"),
+            icon="menu_book",
+            on_click=lambda: open_catalog_dialog(session, _apply_catalog_entry, _current_night, tz=user_tz),
+        ).props("flat dense")
 
     with ui.row().classes("w-full gap-2"):
         exposure_input = ui.select(_exposure_names("tele", dwarf_type), value=draft["shutterName"], label=t("prog_exposure")).classes("flex-1")
         gain_min, gain_max = _gain_range("tele")
         gain_input = ui.number(t("prog_gain"), value=int(draft["gainName"]), min=gain_min, max=gain_max, step=_GAIN_STEP).classes("flex-1")
         filter_input = ui.select(_ir_filter_names(dwarf_type), value=draft["filterModeName"], label=t("ir_filter")).classes("flex-1")
-        count_input = ui.number(t("prog_count"), value=draft["count"], min=1).classes("w-24")
 
     mosaic_cb = ui.checkbox(t("prog_mosaic"), value=False)
     with ui.row().classes("w-full gap-2") as mosaic_fields:
@@ -155,51 +312,90 @@ def build_schedule_editor(session) -> None:
     with ui.row().classes("w-full gap-2 items-end"):
         date_input = date_picker_input(t("prog_date"), draft["date"]).classes("flex-1")
         start_time_input = time_picker_input(t("sched_start_time"), draft["startTime"]).classes("flex-1")
-        # Computed, not manually entered (user-reported Sep 2026: the
-        # schedule's end_time - which the device uses to know when to
-        # STOP - was a separate, independently-typed field, so it could
-        # silently disagree with what "count" images at "shutterName"
-        # exposure would actually take, ending the session early (cut
-        # off mid-sequence) or leaving it running well past the last
-        # planned exposure. Tying duration directly to count x exposure
-        # removes that gap - editing this number no longer does
-        # anything (see the on_value_change handlers on count_input/
-        # exposure_input below, which are the actual source of truth
-        # now), it only ever reflects them.
-        duration_input = ui.number(t("sched_duration_min"), value=draft["durationMin"], min=1).classes("w-32").props("readonly")
+        # End time typed directly, like the official app (user-requested
+        # Oct 2026): the device only gets start/end times (count is sent
+        # as 0, as the official app does) and shoots until the end time.
+        # The former count x exposure duration left no room for goto/
+        # calibration and per-frame overhead: the window ended before
+        # the last frame and the firmware then reported the task as
+        # failed although the stack was saved (DwarfLab's analysis).
+        end_time_input = time_picker_input(t("prog_end_time"), draft["endTime"]).classes("flex-1")
 
-    def _set_start_now_plus_5() -> None:
-        """User-requested Sep 2026: quick \"Now + 5min\" button - the
-        date/time fields above don't reset themselves between targets
-        (deliberately: a second target usually starts later THE SAME
-        night, not \"now\" again), so re-basing them to the current time
-        is otherwise a fully manual re-type of both fields."""
-        now_plus_5 = datetime.now() + timedelta(minutes=5)
-        date_input.value = now_plus_5.strftime("%Y-%m-%d")
-        start_time_input.value = now_plus_5.strftime("%H:%M")
+    def _set_next_free_slot(after: datetime | None = None) -> None:
+        """Start = now + 5 min (or `after`), pushed past the tasks already
+        on the Dwarf and in this editor's list (+ TASK_GAP_MIN), keeping
+        the task's current length (user-requested Oct 2026: by default,
+        right after the running task and the ones chained after it)."""
+        duration = _duration_min(start_time_input.value or "", end_time_input.value or "") or 60
+        earliest = after or (datetime.now(user_tz).replace(tzinfo=None) + timedelta(minutes=TASK_GAP_MIN))
+        busy = [(start, end) for start, end, _name in _busy_windows()]
+        start = next_free_start(earliest, duration, busy)
+        date_input.value = start.strftime("%Y-%m-%d")
+        start_time_input.value = start.strftime("%H:%M")
+        end_time_input.value = (start + timedelta(minutes=duration)).strftime("%H:%M")
 
-    ui.button(t("sched_now_plus_5"), icon="schedule", on_click=_set_start_now_plus_5).props("flat dense")
+    ui.button(t("sched_next_free_slot"), icon="schedule", on_click=lambda: _set_next_free_slot()).props("flat dense")
 
-    def _recompute_duration() -> None:
-        exposure_s = _exposure_seconds(exposure_input.value or "")
-        count = int(count_input.value or 0)
-        if exposure_s is None or count <= 0:
+    # Altitude over the night + best slot, in the DEVICE's timezone like
+    # every other time on this form. Targets already in the list are
+    # drawn on the chart so the next one can be fitted around them.
+    def _current_target() -> tuple[float, float] | None:
+        try:
+            ra, dec = float(ra_input.value), float(dec_input.value)
+        except (TypeError, ValueError):
+            return None
+        return (ra % 24, dec) if -90 <= dec <= 90 else None
+
+    def _current_night() -> datetime:
+        return night_of(date_input.value, start_time_input.value)
+
+    def _apply_slot(start: datetime, end: datetime | None) -> None:
+        # A start already past becomes now + 5 min (device time)
+        start = earliest_start(start, datetime.now(user_tz).replace(tzinfo=None))
+        if end is not None and start >= end:
+            ui.notify(t("planner_slot_over", end=f"{end:%H:%M}"), type="warning")
             return
-        # Ceil, not floor/round: a device stopped by end_time mid-way
-        # through what would have been the last exposure of the
-        # sequence is worse than a session that runs a few seconds past
-        # its last completed exposure - rounding DOWN here would
-        # silently truncate the count the user actually asked for.
-        duration_input.value = math.ceil(2 + (count * exposure_s) / 60) or 0
+        date_input.value = start.strftime("%Y-%m-%d")
+        start_time_input.value = start.strftime("%H:%M")
+        if end is not None:
+            end_time_input.value = end.strftime("%H:%M")
+            ui.notify(t("planner_slot_applied", start=f"{start:%H:%M}", end=f"{end:%H:%M}"))
+        else:
+            ui.notify(t("planner_start_applied", start=f"{start:%Y-%m-%d %H:%M}"))
 
-    count_input.on_value_change(lambda _e: _recompute_duration())
-    exposure_input.on_value_change(lambda _e: _recompute_duration())
-    _recompute_duration()
+    def _busy_windows() -> list[tuple[datetime, datetime, str]]:
+        windows = []
+        for tk in tasks:
+            try:
+                start, end = _task_window(tk)
+            except (KeyError, ValueError):
+                continue
+            windows.append((start, end, tk["name"]))
+        return windows + _device_windows()
+
+    altitude_panel, _refresh_altitude_chart = build_altitude_panel(
+        session,
+        get_target=_current_target,
+        get_night=_current_night,
+        apply_slot=_apply_slot,
+        tz=user_tz,
+        get_busy=_busy_windows,
+    )
+
+    def _refresh_altitude(open_panel: bool = False) -> None:
+        _refresh_altitude_chart()
+        if open_panel and _current_target() is not None:
+            altitude_panel.open()
+
+    for field in (ra_input, dec_input, date_input, start_time_input):
+        field.on_value_change(lambda _e: _refresh_altitude())
+
 
     task_list_container = ui.column().classes("w-full gap-1")
     add_status_label = ui.label("").classes("text-xs text-red-700")
 
     def _render_task_list() -> None:
+        _refresh_altitude()
         task_list_container.clear()
         with task_list_container:
             if not tasks:
@@ -225,6 +421,9 @@ def build_schedule_editor(session) -> None:
             missing.append(t("sched_ra_dec"))
         if not date_input.value.strip() or not start_time_input.value.strip():
             missing.append(t("sched_start_time"))
+        duration = _duration_min(start_time_input.value or "", end_time_input.value or "")
+        if duration is None:
+            missing.append(t("prog_end_time"))
         if missing:
             add_status_label.set_text(t("prog_missing_fields", fields=", ".join(missing)))
             return
@@ -235,27 +434,51 @@ def build_schedule_editor(session) -> None:
             add_status_label.set_text(t("sched_invalid_coords"))
             return
 
-        tasks.append({
+        new_task = {
             "name": target_name_input.value.strip(),
             "ra": ra_val,
             "dec": dec_val,
             "shutterName": exposure_input.value or "",
             "gainName": str(int(gain_input.value)),
             "filterModeName": filter_input.value or "",
-            "count": 0, #int(count_input.value or 0),
+            "count": 0,
             "mosaic": bool(mosaic_cb.value),
             "horizontalScale": float(h_scale_input.value or 1.0),
             "verticalScale": float(v_scale_input.value or 1.0),
             "date": date_input.value.strip(),
             "startTime": start_time_input.value.strip(),
-            "durationMin": int(duration_input.value or 30),
-        })
+            "durationMin": duration,
+        }
+        try:
+            conflict = _find_conflict(new_task, tasks)
+        except ValueError:
+            add_status_label.set_text(t("prog_missing_fields", fields=t("sched_start_time")))
+            return
+        if conflict is not None:
+            add_status_label.set_text(t("sched_task_overlap", name=conflict["name"], gap=TASK_GAP_MIN))
+            return
+        new_start, new_end = _task_window(new_task)
+        gap = timedelta(minutes=TASK_GAP_MIN)
+        for start, end, name in _device_windows():
+            if new_start < end + gap and start < new_end + gap:
+                add_status_label.set_text(t(
+                    "sched_task_overlap_device", name=name, start=f"{start:%H:%M}", end=f"{end:%H:%M}", gap=TASK_GAP_MIN
+                ))
+                return
+        tasks.append(new_task)
+        tasks.sort(key=lambda tk: _task_window(tk)[0])
+        # Pre-fill the next free slot: the next target usually follows
+        # this one the same night.
+        _set_next_free_slot(after=_task_window(new_task)[1])
         add_status_label.set_text("")
         target_name_input.value = ""
         ra_input.value = ""
         dec_input.value = ""
         stellarium_status.set_text("")
         _render_task_list()
+
+    # Default slot: now + 5 min, after the tasks already on the Dwarf
+    _set_next_free_slot()
 
     ui.button(t("sched_add_to_schedule"), icon="add", on_click=_add_task).props("flat")
 
@@ -264,27 +487,38 @@ def build_schedule_editor(session) -> None:
 
     sync_status_label = ui.label("").classes("text-sm")
 
-    import time
-
-    def generate_dwarf_uuid(suffix="Android"):
-        # Genère un UUID propre + timestamp ms + suffixe requis par le firmware DWARF 3
-        raw_uuid = str(uuid.uuid4()).replace("-", "")[:32]
+    def _dwarf_ids(n_tasks: int) -> tuple[str, list[str]]:
+        """Schedule id + one id per task, in the official app's format
+        (device dump, Oct 2026): every id is the SAME UUID followed by a
+        millisecond timestamp - "<uuid><ms>.Android" for the schedule,
+        "<uuid><ms>" (no suffix) for each task, with a distinct timestamp
+        for each one so no id ever repeats."""
+        raw_uuid = str(uuid.uuid4())
         ts_ms = int(time.time() * 1000)
-        return f"{raw_uuid}{ts_ms}.{suffix}"
-    
-    def _build_wire_tasks() -> list[dict]:
+        schedule_id = f"{raw_uuid}{ts_ms}.Android"
+        task_ids = [f"{raw_uuid}{ts_ms + 1 + i}" for i in range(n_tasks)]
+        return schedule_id, task_ids
+
+    def _build_wire_tasks(task_ids: list[str]) -> list[dict]:
         wire_tasks = []
-        for tk in tasks:
-            # 1. Parsing UTC strict
-            print(f"{tk['date']} {tk['startTime']}")
-            start_dt = datetime.strptime(
+        for tk, task_id in zip(tasks, task_ids):
+            # 1. Parsing locale hour from timezone
+            local_dt = datetime.strptime(
                 f"{tk['date']} {tk['startTime']}", "%Y-%m-%d %H:%M"
-            ).replace(tzinfo=timezone.utc)
-            print(f"start_dt: {start_dt}")
-            # 2. Timestamps POSIX en SECONDES (10 chiffres)
-            start_s = int(start_dt.timestamp())
-            end_s = start_s + int(tk["durationMin"] * 60)
-            print(f"start_s: {start_s}")
+            ).replace(tzinfo=user_tz)
+
+            # 2. Convert to UTC 
+            utc_dt = local_dt.astimezone(timezone.utc)
+
+            # 3. Timestamp Unix POSIX (10 digits)
+            start_s = int(utc_dt.timestamp())
+            # Whole minutes only: the device rejects any other duration
+            # with CODE_SHOOTING_SCHEDULE_INVALID_SHOOTING_DURATION (-16301).
+            end_s = start_s + int(tk["durationMin"]) * 60
+            log.debug(
+                f"Saisie locale ({user_tz}): {local_dt.strftime('%Y-%m-%d %H:%M %Z')} "
+                f"-> UTC: {utc_dt.strftime('%Y-%m-%d %H:%M %Z')} (start_s: {start_s})"
+            )
 
             is_mosaic = tk["mosaic"] and not (
                 tk["horizontalScale"] == 1.0 and tk["verticalScale"] == 1.0
@@ -310,8 +544,8 @@ def build_schedule_editor(session) -> None:
                 "verticalScale": int(round(tk["verticalScale"] * 100))
                 if is_mosaic
                 else 100,
-                "schedule_task_id": generate_dwarf_uuid("Android"),
-                "createFrom": 2,
+               "schedule_task_id": task_id,
+               "createFrom": 2,
             })
         return wire_tasks
 
@@ -321,31 +555,26 @@ def build_schedule_editor(session) -> None:
             sync_status_label.classes(replace="text-sm text-red-700")
             return
 
-        wire_tasks = _build_wire_tasks()
+        schedule_id, task_ids = _dwarf_ids(len(tasks))
+        wire_tasks = _build_wire_tasks(task_ids)
         starts = [tk["startTime"] for tk in wire_tasks]
         ends = [tk["endTime"] for tk in wire_tasks]
-        print(f"_handle_sync: starts {starts}")
-        print(f"_handle_sync: ends {ends}")
-        # STALENESS CHECK (user-reported Sep 2026: got -16308 CODE_
-        # SHOOTING_SCHEDULE_START_TIME_TOO_FAR on a manual entry test) -
-        # mirrors the same check already added to the DSO catalog page
-        # for the exact same field-confirmed device limit: a task whose
-        # window is more than 12h from "now" (in either direction) gets
-        # rejected outright. Checked here BEFORE sending, with a clear
-        # message, instead of surfacing the device's bare error code -
-        # a manually-typed date/time is an easy way to hit this by
-        # mistake (unlike the catalog page's auto-computed "tonight").
-        # Comparaison basée sur des SECONDES
+        log.debug(f"_handle_sync: starts {starts} ends {ends}")
+        # TIME WINDOW (device-confirmed Oct 2026): the Dwarf only accepts
+        # a schedule synced less than 12 h before its start (-16308 CODE_
+        # SHOOTING_SCHEDULE_START_TIME_TOO_FAR otherwise). A window that
+        # has already ended is refused here; one starting further out is
+        # NOT an error anymore - it's stored as pending and synced
+        # automatically once in range (scheduler_loop.check_pending_
+        # schedules()).
         now_s = int(datetime.now(timezone.utc).timestamp())
-        twelve_h_s = 12 * 3600
-
-        if min(starts) - twelve_h_s > now_s or max(ends) + twelve_h_s < now_s:
+        if max(ends) <= now_s or min(starts) + 12 * 3600 < now_s:
             sync_status_label.set_text(t("sched_stale"))
             sync_status_label.classes(replace="text-sm text-red-700")
             return
-    
+
         schedule = {
-            "scheduleId": generate_dwarf_uuid(), #str(uuid.uuid4()),
+            "scheduleId": schedule_id,
             "scheduleName": schedule_name_input.value.strip() or "Schedule",
             "startTime": min(starts),
             "endTime": max(ends),
@@ -357,12 +586,25 @@ def build_schedule_editor(session) -> None:
                 "latitude": session.config.latitude,
                 # No city-name field existed at all on DwarfConfig until
                 # user-requested (Sep 2026) - now set in Settings, read
-                "cityName": "", #session.config.city_name or "",
+                "cityName": session.config.city_name or "",
                 "focusMode": 0,
             },
             "shooting_tasks": wire_tasks,
         }
-
+        log.debug(f"Native schedule: {schedule}")
+        if pending_schedules.is_too_early(schedule):
+            schedule["autoSync"] = True
+            replaced = pending_schedules.get_pending(dwarf_uid) is not None
+            pending_schedules.set_pending(dwarf_uid, schedule)
+            opens_at = datetime.fromtimestamp(pending_schedules.sync_opens_at(schedule), user_tz)
+            msg = t("sched_deferred", time=f"{opens_at:%Y-%m-%d %H:%M}")
+            if replaced:
+                msg += " " + t("sched_deferred_replaced")
+            sync_status_label.set_text(msg)
+            sync_status_label.classes(replace="text-sm text-amber-8")
+            tasks.clear()
+            _render_task_list()
+            return
         if not connection_health.try_acquire_command_slot(dwarf_uid, caller="schedule_editor.sync"):
             sync_status_label.set_text(t("device_busy"))
             sync_status_label.classes(replace="text-sm text-red-700")
@@ -379,6 +621,8 @@ def build_schedule_editor(session) -> None:
             sync_status_label.classes(replace="text-sm text-green-700")
             tasks.clear()
             _render_task_list()
+            # Show it in the "already on the Dwarf" reminder right away
+            await _refresh_device_schedules()
         else:
             sync_status_label.set_text(t("sched_sync_failed"))
             sync_status_label.classes(replace="text-sm text-red-700")
