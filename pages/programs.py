@@ -11,20 +11,22 @@ The Scripts tab also carries the per-device scheduler arm/disarm switch
 it's exactly the queue that switch controls."""
 from __future__ import annotations
 
-import json
 import os
 import uuid
 from datetime import datetime
 
-from nicegui import ui
+from nicegui import run, ui
 
 from dwarf_python_api.lib.dwarf_session import get_manager
 
-from components import scheduler_loop, scheduler_runner
+from components import scheduler_loop, scheduler_runner, task_check_cache
 from components.i18n import get_language, t
+from components.json_files import read_json, write_json_atomic
 from components.program_editor import build_program_editor
+from components.site_time import site_now
 from components.schedule_editor import build_schedule_editor
 from components.session_dirs import session_dirs_for
+from components.task_check import open_task_check, program_task
 from components.pwa import add_pwa_head_tags
 from components.theme import apply_theme
 
@@ -36,11 +38,19 @@ def _list_json_files(directory: str) -> list[str]:
 
 
 def _read_json(filepath: str) -> dict | None:
-    try:
-        with open(filepath, encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return None
+    data, _reason = read_json(filepath)
+    return data
+
+
+def _notify_unreadable(filepath: str) -> None:
+    """Why a program file couldn't be read (user-reported Oct 2026: a
+    plain "Invalid JSON file" with no detail, also when the file had just
+    left ToDo)."""
+    _data, reason = read_json(filepath)
+    if reason == "missing":
+        ui.notify(t("program_file_missing", name=os.path.basename(filepath)), type="warning")
+    else:
+        ui.notify(t("program_invalid_json", error=f"{os.path.basename(filepath)}: {reason}"), type="negative")
 
 
 def _parse_datetime(date_str: str | None, time_str: str | None) -> datetime | None:
@@ -197,7 +207,7 @@ def build_programs_page() -> None:
                     def load_for_edit(filepath: str) -> None:
                         data = _read_json(filepath)
                         if data is None:
-                            ui.notify(t("program_invalid_json", error=""), type="negative")
+                            _notify_unreadable(filepath)
                             return
                         tabs.set_value(editor_tab)
                         render_editor(initial=data)
@@ -205,7 +215,7 @@ def build_programs_page() -> None:
                     def relaunch(filepath: str) -> None:
                         data = _read_json(filepath)
                         if data is None:
-                            ui.notify(t("program_invalid_json", error=""), type="negative")
+                            _notify_unreadable(filepath)
                             return
                         try:
                             scheduler_runner.start_run(
@@ -278,7 +288,7 @@ def build_programs_page() -> None:
                         entry is left untouched as history."""
                         data = _read_json(filepath)
                         if data is None:
-                            ui.notify(t("program_invalid_json", error=""), type="negative")
+                            _notify_unreadable(filepath)
                             return
                         tabs.set_value(editor_tab)
                         render_editor(initial=data)
@@ -305,12 +315,12 @@ def build_programs_page() -> None:
                         confusion with the original file's own identity."""
                         data = _read_json(filepath)
                         if data is None:
-                            ui.notify(t("program_invalid_json", error=""), type="negative")
+                            _notify_unreadable(filepath)
                             return
 
                         cmd = data.get("command", {})
                         id_command = cmd.setdefault("id_command", {})
-                        now = datetime.now()
+                        now = site_now(session.config)
                         id_command["uuid"] = f"{uuid.uuid4()}-00001"
                         id_command["date"] = now.strftime("%Y-%m-%d")
                         id_command["time"] = now.strftime("%H:%M:%S")
@@ -319,8 +329,7 @@ def build_programs_page() -> None:
                         os.makedirs(dirs["TODO_DIR"], exist_ok=True)
                         new_filename = f"{id_command['date']}-{id_command['time'].replace(':', '-')}-relaunch.json"
                         new_filepath = os.path.join(dirs["TODO_DIR"], new_filename)
-                        with open(new_filepath, "w", encoding="utf-8") as f:
-                            json.dump({"command": cmd}, f, indent=4)
+                        write_json_atomic(new_filepath, {"command": cmd})
 
                         try:
                             scheduler_runner.start_run(
@@ -331,6 +340,19 @@ def build_programs_page() -> None:
                             return
                         ui.notify(t("program_running"), type="positive")
                         ui.navigate.to(f"/session/{dwarf_uid}")
+
+                    async def force_resume(filepath: str) -> None:
+                        """Error/ program whose capture the Dwarf is still
+                        running: back to Current/ and resumed (see
+                        scheduler_runner.force_resume_from_error())."""
+                        ok = await run.io_bound(
+                            scheduler_runner.force_resume_from_error, dwarf_uid, session, filepath
+                        )
+                        ui.notify(
+                            t("results_force_resume_done") if ok else t("results_force_resume_failed"),
+                            type="positive" if ok else "warning",
+                        )
+                        render_results()
 
                     def render_results() -> None:
                         results_container.clear()
@@ -405,10 +427,20 @@ def build_programs_page() -> None:
                                                 f" \u00b7 {t('prog_mosaic')}"
                                             )
                                         ui.label(detail).classes("text-xs")
+                                    check_task = program_task(program, session.config)
+                                    if not id_command.get("shots_taken") and check_task is not None:
+                                        # Counts found by an earlier View / Check
+                                        shots = task_check_cache.shots_text(
+                                            task_check_cache.get(dwarf_uid, check_task), t("prog_shots_stacked")
+                                        )
+                                        if shots:
+                                            ui.label(shots).classes("text-xs")
                                     if id_command.get("starting_date") or id_command.get("processed_date"):
+                                        # "Error" date for a failed run
+                                        end_label = t("results_failed_at") if kind == "error" else t("results_finished")
                                         ui.label(
                                             f"{t('results_started')}: {id_command.get('starting_date', '\u2013')}"
-                                            f"  \u2192  {t('results_finished')}: {id_command.get('processed_date', '\u2013')}"
+                                            f"  \u2192  {end_label}: {id_command.get('processed_date', '\u2013')}"
                                         ).classes("text-xs text-grey-5")
                                     with ui.row().classes("gap-1 mt-1"):
                                         ui.button(
@@ -419,6 +451,30 @@ def build_programs_page() -> None:
                                             icon="replay",
                                             on_click=lambda p=filepath: relaunch_result(p),
                                         ).props("flat dense round color=primary")
+                                        # What the Dwarf saved for this run: "View" (done,
+                                        # blue) / "Check" (error, red), see task_check.py
+                                        if check_task is not None:
+                                            ui.button(
+                                                t("task_view") if kind == "done" else t("task_check"),
+                                                icon="image" if kind == "done" else "fact_check",
+                                                on_click=lambda _, task=check_task: open_task_check(
+                                                    session, task, on_result=render_results
+                                                ),
+                                            ).props(
+                                                f"flat dense no-caps size=sm color={'primary' if kind == 'done' else 'negative'}"
+                                            )
+                                        # The Dwarf is still capturing this
+                                        # program's target (error < 15 h)
+                                        if kind == "error" and scheduler_runner.can_force_resume(
+                                            dwarf_uid, session, program
+                                        ):
+                                            ui.button(
+                                                t("results_force_resume"),
+                                                icon="play_circle",
+                                                on_click=lambda p=filepath: force_resume(p),
+                                            ).props("flat dense no-caps color=positive").tooltip(
+                                                t("results_force_resume_hint")
+                                            )
 
                     render_results()
 
