@@ -12,14 +12,18 @@ enough to detect a connection that died mid-session (e.g. a Wi-Fi
 glitch causing a command timeout, rather than a clean disconnect)."""
 from __future__ import annotations
 
+import traceback
+
+import dwarf_python_api.lib.my_logger as log
 from nicegui import ui,run,app
 
 from dwarf_python_api.lib.dwarf_session import get_manager
 
-from components import connection_health
+from components import connection_health, device_lock, device_prefs
 from components.device_card import DeviceCardView
 from components.network_info import watch_qr_svg, watch_url
-from components.i18n import SUPPORTED_LANGUAGES, get_language, set_language, t
+from components.app_version import get_app_version
+from components.i18n import AVAILABLE_LANGUAGES, SUPPORTED_LANGUAGES, get_language, set_language, t
 from components.pwa import add_pwa_head_tags
 from components.theme import apply_theme, theme_toggle_button
 
@@ -55,6 +59,10 @@ async def _handle_connect_all(button: ui.button | None = None) -> None:
         skipped = 0
         failed = 0
         for session in targets:
+            if device_lock.held_elsewhere(session.dwarf_uid) or device_prefs.is_hidden(session.dwarf_uid):
+                skipped += 1
+                continue
+            connection_health.clear_taken_over(session.dwarf_uid)
             if not connection_health.try_acquire_command_slot(session.dwarf_uid, caller="dashboard.connect_all"):
                 skipped += 1
                 continue
@@ -66,7 +74,7 @@ async def _handle_connect_all(button: ui.button | None = None) -> None:
                 connected += 1
                 connection_health.mark_just_connected(session.dwarf_uid)
                 from components import scheduler_runner  # local import - avoids circular import
-                await run.io_bound(scheduler_runner.reconcile_orphaned_current_files, uid, session)
+                await run.io_bound(scheduler_runner.reconcile_orphaned_current_files, session.dwarf_uid, session)
             else:
                 failed += 1
     finally:
@@ -135,18 +143,30 @@ def build_dashboard_page() -> None:
                     # buttons next to it, at "fr"'s expense on a narrow
                     # screen) - only 2 languages exist right now, so a
                     # toggle is both narrower AND matches the row's
-                    # existing icon-button sizing exactly. Would need to
-                    # go back to a real dropdown if a 3rd language is
-                    # ever added.
+                    # existing icon-button sizing exactly.
+                    # With a 3rd language (a locale file with ENABLED = True,
+                    # see components/i18n.py) the button opens a menu of the
+                    # enabled languages instead (user-requested Oct 2026).
+                    def _switch_language(lang: str) -> None:
+                        set_language(lang)
+                        ui.navigate.reload()
+
                     def _toggle_language() -> None:
                         current = get_language()
                         other = next(lang for lang in SUPPORTED_LANGUAGES if lang != current)
-                        set_language(other)
-                        ui.navigate.reload()
+                        _switch_language(other)
 
-                    ui.button(get_language().upper(), on_click=_toggle_language).props(
-                        "flat round dense"
-                    ).classes("text-xs")
+                    if len(SUPPORTED_LANGUAGES) > 2:
+                        with ui.button(get_language().upper()).props("flat round dense").classes("text-xs"):
+                            with ui.menu():
+                                for code, name in AVAILABLE_LANGUAGES.items():
+                                    ui.menu_item(
+                                        f"{name} ({code})", on_click=lambda _, c=code: _switch_language(c)
+                                    ).classes("font-bold" if code == get_language() else "")
+                    elif len(SUPPORTED_LANGUAGES) == 2:
+                        ui.button(get_language().upper(), on_click=_toggle_language).props(
+                            "flat round dense"
+                        ).classes("text-xs")
                     ui.button(
                         icon="add", on_click=lambda: ui.navigate.to("/pairing")
                     ).props("flat round")
@@ -183,6 +203,12 @@ def build_dashboard_page() -> None:
                     theme_toggle_button()
 
             empty_label = ui.label(t("no_devices_configured")).classes("text-grey-6 text-sm")
+            # A devices.json entry not loaded at startup, and why
+            from device_registry import BOOT_PROBLEMS
+            if BOOT_PROBLEMS:
+                from components.status_banner import status_banner
+                status_banner(t("devices_not_loaded", count=len(BOOT_PROBLEMS)), kind="warning",
+                              detail=" · ".join(BOOT_PROBLEMS))
             cards_container = ui.grid(columns=columns).classes("w-full gap-3")
             # smartscopes hook: Seestar & other non-Dwarf telescopes (fork addition)
             import smartscopes; smartscopes.render_dashboard_section()
@@ -191,24 +217,52 @@ def build_dashboard_page() -> None:
             # page so poll() below can update() them in place instead of
             # rebuilding the whole list.
             cards: dict[str, DeviceCardView] = {}
+            # Order and hidden flags the cards were built with
+            built_layout: list = []
+
+            async def _toggle_hidden(uid: str) -> None:
+                device_prefs.set_hidden(uid, not device_prefs.is_hidden(uid))
+                built_layout.clear()
+                await poll()  # rebuilt now, in the new order
+
+            async def _move(uid: str, where: str) -> None:
+                device_prefs.move(uid, manager.all(), where)
+                built_layout.clear()
+                await poll()
 
             async def poll() -> None:
-                sessions = manager.all()
-                current_uids = {s.dwarf_uid for s in sessions}
+                sessions = device_prefs.display_order(manager.all())
+                layout = [(s.dwarf_uid, device_prefs.is_hidden(s.dwarf_uid)) for s in sessions]
 
                 # Rare path: the device list itself changed (a device
-                # was paired/removed while this page stayed open) - full
+                # was paired/removed while this page stayed open), or a
+                # Dwarf was hidden/shown (moves to / from the end) - full
                 # rebuild is fine here since it happens once, not every
                 # tick.
-                if current_uids != set(cards):
+                if layout != built_layout:
                     cards_container.clear()
                     cards.clear()
-                    with cards_container:
-                        for session in sessions:
-                            cards[session.dwarf_uid] = DeviceCardView(
-                                session, on_open=_open_device
-                            )
                     empty_label.set_visibility(not sessions)
+                    with cards_container:
+                        for session, (_uid, hidden) in zip(sessions, layout):
+                            # One Dwarf's card failing doesn't take the
+                            # others with it (user-reported Oct 2026: after
+                            # a change of Site, one card shown under "No
+                            # Dwarf configured yet" - the loop stopped at
+                            # the next one, on every tick): said on its
+                            # place, the error in the log
+                            try:
+                                cards[session.dwarf_uid] = DeviceCardView(
+                                    session, on_open=_open_device,
+                                    on_toggle_hidden=_toggle_hidden, hidden=hidden, on_move=_move,
+                                )
+                            except Exception as e:
+                                log.error(f"[{session.dwarf_uid}] Dashboard card not built: {e}\n"
+                                          + traceback.format_exc())
+                                with ui.card().classes("w-full"):
+                                    ui.label(session.dwarf_uid).classes("font-medium")
+                                    ui.label(t("card_build_failed", error=e)).classes("text-sm text-negative")
+                    built_layout[:] = layout
                     return
 
                 # Common path: same devices as last tick - active
@@ -217,7 +271,14 @@ def build_dashboard_page() -> None:
                 # no DOM teardown for anything that hasn't changed.
                 for session in sessions:
                     await connection_health.maybe_check(session)
-                    cards[session.dwarf_uid].update(session)
+                    card = cards.get(session.dwarf_uid)
+                    if card is None:
+                        continue
+                    try:
+                        card.update(session)
+                    except Exception as e:
+                        log.error(f"[{session.dwarf_uid}] Dashboard card not updated: {e}\n"
+                                  + traceback.format_exc())
 
             # Watch-mode QR code (user-requested Sep 2026): opens a
             # dialog with a QR code + the plain URL for /watch, so a
@@ -237,6 +298,12 @@ def build_dashboard_page() -> None:
                         ui.label(watch_url()).classes("text-xs text-grey-6")
                         ui.button(t("close"), on_click=dialog.close).props("flat")
                     dialog.open()
+
+                # Version, small, at the left of the logo's line
+                # (user-requested Oct 2026)
+                version = get_app_version()
+                if version:
+                    ui.label(f"v{version}").classes("text-xs text-grey-6 absolute left-0")
 
                 ui.button(icon="qr_code_2", on_click=_open_watch_qr).props("flat round")
 

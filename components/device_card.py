@@ -23,13 +23,14 @@ from dwarf_python_api.get_config_data import config_to_dwarf_id_str
 from dwarf_python_api.lib.dwarf_session import DwarfSession
 from dwarf_python_api.lib.dwarf_session_socket import get_client_status
 
-from components import connection_health, scheduler_loop, scheduler_runner
+from components import connection_health, capture_stall, current_activity, device_lock, device_task, scheduler_loop, scheduler_runner
 from components.camera_stream import (
     build_dashboard_thumbnail,
     dashboard_thumbnail_refresh_source,
     dashboard_thumbnail_should_show,
 )
 from components.i18n import t
+from device_registry import device_name
 from components.status_banner import status_banner
 
 
@@ -127,37 +128,130 @@ def _apply_warning_style(icon: ui.icon, label: ui.label, is_low: bool) -> None:
         label.classes(replace=f"text-grey-7 {_INFO_TEXT_CLASSES}")
 
 
+def _activity_title(activity: dict | None) -> str:
+    """Banner title for the current target: "M 42" for a program,
+    "Schedule name · M 42" for a native schedule task."""
+    if not activity or not activity["target"]:
+        return ""
+    if activity["source"] == "schedule":
+        return t("card_schedule_target", schedule=activity["title"], target=activity["target"])
+    return activity["target"]
+
+
+def _schedule_detail(session: DwarfSession, activity: dict) -> str:
+    """"Task 2/3 · 21:05–22:30" for a native schedule task."""
+    text = t("card_schedule_task", index=activity["index"], total=activity["total"])
+    window = current_activity.format_window(session, activity["start"], activity["end"])
+    return f"{text} \u00b7 {window}" if window else text
+
+
+
 class DeviceCardView:
     """One card per DwarfSession, built once. Call update(session) on
     every poll instead of recreating the card."""
 
-    def __init__(self, session: DwarfSession, on_open: Callable[[str], None]) -> None:
+    async def _identify(self) -> None:
+        from components.identify import identify_and_notify
+        await identify_and_notify(self._session.config.dwarf_ip)
+
+    def __init__(
+        self,
+        session: DwarfSession,
+        on_open: Callable[[str], None],
+        on_toggle_hidden: Callable[[str], None] | None = None,
+        hidden: bool = False,
+        on_move: Callable[[str, str], None] | None = None,
+        watch: bool = False,
+    ) -> None:
+        """watch: on the watch dashboard - the image opens the watch's
+        full-screen view. on_toggle_hidden(uid): called by the card's hide/show button
+        (the dashboard moves the card and saves the choice - see
+        components/device_prefs.py). hidden: only the header is shown.
+        on_move(uid, where): called by the card's order menu, where being
+        "first", "up", "down" or "last"."""
         self.dwarf_uid = session.dwarf_uid
+        self._session = session         # the latest one (update()), for Identify
+        self.hidden = hidden
+        self._live_url = f"/watch/{session.dwarf_uid}/live" if watch else f"/live/{session.dwarf_uid}"
+        self._adjust_version: str | None = None
         self._banner_kind: str | None = None
         self._dynamic_label: ui.label | None = None
         self._dynamic_detail: ui.label | None = None
         self._thumbnail: ui.image | None = None
+        self._stall_label: ui.label | None = None
 
         with ui.card().classes("w-full cursor-pointer").on(
             "click", lambda: on_open(self.dwarf_uid)
         ) as self.card:
+            # The name's block never wider than the card (user-reported Oct
+            # 2026: on a phone "DWARF3_3C2E2A · 192.168.1.93" ran out of it) -
+            # the buttons still go under it when the card is narrow
             with ui.row().classes("items-center justify-between w-full"):
-                with ui.row().classes("items-center gap-2 min-w-0"):
+                with ui.row().classes("items-center gap-2 min-w-0 max-w-full no-wrap"):
                     ui.icon("satellite_alt").classes("text-2xl text-grey-6 shrink-0")
-                    with ui.column().classes("gap-0 min-w-0"):
+                    with ui.column().classes("gap-0 min-w-0 flex-1"):
                         # truncate (user-reported Sep 2026: a long device
                         # name/UID could disrupt the card's layout) -
                         # ellipsis instead of wrapping/overflowing; the
                         # full name is still available in the title
                         # attribute and via the session page this card
                         # opens.
-                        ui.label(session.dwarf_uid).classes("font-medium truncate").props(
+                        # The name given at its addition, its uid under it
+                        # (user-reported Oct 2026: only the uid was shown)
+                        name = device_name(session)
+                        ui.label(name).classes("font-medium truncate").props(
                             f"title='{session.dwarf_uid}'"
                         )
-                        ui.label(session.config.dwarf_ip or t("unknown_ip")).classes(
-                            "text-xs text-grey-6 truncate"
+                        ui.label(" · ".join(x for x in (
+                            session.dwarf_uid if name != session.dwarf_uid else "",
+                            session.config.dwarf_ip or t("unknown_ip")) if x)).classes(
+                            "text-xs text-grey-6 break-words"   # wraps after the "·" on a phone
                         )
                 with ui.row().classes("items-center gap-1"):
+                    if on_move is not None:
+                        # Display order: stopPropagation so the menu button
+                        # doesn't open the device (the menu itself is
+                        # rendered outside the card)
+                        with ui.button(icon="swap_vert").props("flat round dense size=sm").classes(
+                            "text-grey-6"
+                        ).tooltip(t("device_order")).on(
+                            "click", js_handler="(e) => e.stopPropagation()"
+                        ):
+                            with ui.menu():
+                                for where, icon, label in (
+                                    ("first", "vertical_align_top", "device_move_first"),
+                                    ("up", "arrow_upward", "device_move_up"),
+                                    ("down", "arrow_downward", "device_move_down"),
+                                    ("last", "vertical_align_bottom", "device_move_last"),
+                                ):
+                                    with ui.menu_item(
+                                        on_click=lambda _e, w=where: on_move(self.dwarf_uid, w)
+                                    ):
+                                        with ui.row().classes("items-center gap-2 no-wrap"):
+                                            ui.icon(icon).classes("text-grey-7")
+                                            ui.label(t(label))
+                    # Identify: its ring light flashes (several Dwarfs on the
+                    # table); stopPropagation: not the card's own click
+                    ui.button(icon="flare").props("flat round dense size=sm").classes(
+                        "text-grey-6"
+                    ).tooltip(t("identify_button")).on(
+                        "click",
+                        lambda: self._identify(),
+                        js_handler="(e) => { e.stopPropagation(); emit(); }",
+                    )
+                    if on_toggle_hidden is not None:
+                        # Hide / show this Dwarf (header only, listed last,
+                        # not auto-connected); stopPropagation: not the
+                        # card's own click, which opens the device
+                        ui.button(
+                            icon="visibility" if hidden else "visibility_off"
+                        ).props("flat round dense size=sm").classes("text-grey-6").tooltip(
+                            t("device_show") if hidden else t("device_hide")
+                        ).on(
+                            "click",
+                            lambda: on_toggle_hidden(self.dwarf_uid),
+                            js_handler="(e) => { e.stopPropagation(); emit(); }",
+                        )
                     # Always present (not conditionally created) so
                     # toggling the scheduler for this device never
                     # reflows the card - just a colour/visibility swap
@@ -171,6 +265,13 @@ class DeviceCardView:
                     # frozen on the "on" wording forever).
                     self._scheduler_icon = ui.icon("schedule")
                     self._status_dot = ui.icon("circle")
+            # A capture whose count no longer moves, in the card's header
+            # (user-asked Oct 2026: a hung DWARF 3 read "Capture in progress
+            # 141/500" all night) - see components/capture_stall.py
+            self._stall_label = ui.label("").classes(
+                "w-full text-sm font-medium text-orange-9 bg-orange-1 rounded px-2 py-1"
+            )
+            self._stall_label.set_visibility(False)
             # "Mission control" row (user-requested Sep 2026: monitor
             # running sessions across devices with a way to jump to the
             # live stacking view) - a PERSISTENT row, ALWAYS visible,
@@ -269,7 +370,7 @@ class DeviceCardView:
                         )
                     self._idle_last_run_row.set_visibility(False)
                 with ui.column().classes("gap-2 w-full") as self._active_content:
-                    self._thumbnail, self._thumbnail_open_button = build_dashboard_thumbnail(session)
+                    self._thumbnail, self._thumbnail_open_button = build_dashboard_thumbnail(session, self._live_url)
                     # Small icon + Battery/Temperature/Disk, all in a
                     # single horizontal LINE below the full-width image
                     # (revised Sep 2026 - the user settled on this
@@ -302,10 +403,16 @@ class DeviceCardView:
             # Only this small container is ever cleared/rebuilt, and
             # only when the banner's structural kind changes.
             self._banner_slot = ui.column().classes("w-full gap-0")
+            if hidden:
+                # Header only (name, IP, status dot)
+                self._info_row.set_visibility(False)
+                self._banner_slot.set_visibility(False)
+                self.card.classes("opacity-70")
 
         self.update(session)
 
     def update(self, session: DwarfSession) -> None:
+        self._session = session
         full_status: dict = {}
         new_values: dict = {}
         if session.is_connected:
@@ -320,6 +427,11 @@ class DeviceCardView:
         connected = connection_health.is_actually_connected(session)
         connection_lost = session.is_connected and not connected
         program_running = scheduler_runner.is_running(session.dwarf_uid)
+        # Program of this app or native schedule task running now (target
+        # shown in the banner - see components/current_activity.py)
+        activity = current_activity.current_activity(session, full_status) if session.is_connected else None
+        # A task of the Dwarf's own (a megastack, whoever started it)
+        device_task_now = device_task.running_task(session) if session.is_connected else None
 
         if error:
             kind = "error"
@@ -331,10 +443,21 @@ class DeviceCardView:
             # visible indicator at all before this, only showing up on
             # the Programs page's own step log at the bottom.
             kind = "program_running"
+        elif device_task_now is not None and not connection_lost:
+            kind = "device_task"
         elif connection_lost:
             kind = "connection_lost"
+        elif not session.is_connected and connection_health.is_taken_over(session.dwarf_uid):
+            # Dropped right after each reconnection: another client has it
+            kind = "taken_over"
+        elif not session.is_connected and device_lock.held_elsewhere(session.dwarf_uid):
+            # Another Astro Dwarf Session instance on this PC uses it
+            kind = "used_elsewhere"
         elif not session.is_connected:
             kind = "disconnected"
+        elif activity and activity["source"] == "schedule":
+            # Native schedule window (goto/calibration before the capture)
+            kind = "schedule_running"
         else:
             kind = "connected"
 
@@ -351,7 +474,8 @@ class DeviceCardView:
         # "Mission control" row: ALWAYS visible - one of THREE alternate
         # contents (see constructor's own note for the full reasoning).
         # No sub-row is ever recreated, only toggled/updated in place.
-        active_session = kind in ("capturing", "program_running")
+        # A megastack run by the Dwarf (any app) shows its stack too
+        active_session = kind in ("capturing", "program_running", "device_task")
         self._disconnected_content.set_visibility(not session.is_connected)
         self._idle_content.set_visibility(session.is_connected and not active_session)
         self._active_content.set_visibility(session.is_connected and active_session)
@@ -441,13 +565,32 @@ class DeviceCardView:
             # active_session is already True here (this branch is only
             # reached in that case) - only camera availability itself
             # gates the thumbnail now.
-            show_thumbnail = dashboard_thumbnail_should_show(session)
+            # The display adjustments made in the full-screen view
+            # (components/live_view.py), followed when they change
             if self._thumbnail is not None:
-                self._thumbnail.set_visibility(show_thumbnail)
-                if show_thumbnail:
-                    dashboard_thumbnail_refresh_source(session, self._thumbnail, new_values)
-            if self._thumbnail_open_button is not None:
-                self._thumbnail_open_button.set_visibility(show_thumbnail)
+                from components import live_view
+                version = live_view.adjust_version(self.dwarf_uid)
+                if version != self._adjust_version:
+                    self._adjust_version = version
+                    live_view.apply_adjustments(self.dwarf_uid)
+            # A megastack: its stack's thumbnail instead of the Tele preview
+            # (nothing to see there meanwhile), re-read on progress
+            megastack_thumb = device_task.megastack_preview_url(session)
+            if megastack_thumb:
+                if self._thumbnail is not None:
+                    self._thumbnail.set_visibility(True)
+                    if self._thumbnail.source != megastack_thumb:
+                        self._thumbnail.set_source(megastack_thumb)
+                if self._thumbnail_open_button is not None:
+                    self._thumbnail_open_button.set_visibility(False)
+            else:
+                show_thumbnail = dashboard_thumbnail_should_show(session)
+                if self._thumbnail is not None:
+                    self._thumbnail.set_visibility(show_thumbnail)
+                    if show_thumbnail:
+                        dashboard_thumbnail_refresh_source(session, self._thumbnail, new_values)
+                if self._thumbnail_open_button is not None:
+                    self._thumbnail_open_button.set_visibility(show_thumbnail)
 
         if kind != self._banner_kind:
             self._banner_kind = kind
@@ -458,8 +601,14 @@ class DeviceCardView:
                 if kind == "error":
                     status_banner(t("error_with_detail", error=error), kind="danger")
                 elif kind == "capturing":
-                    self._dynamic_label = self._build_dynamic_banner(
-                        icon="play_arrow", css="bg-blue-50 text-blue-800"
+                    # Title: the current target (hidden when unknown),
+                    # detail: the capture progress
+                    self._dynamic_detail, self._dynamic_label = self._build_dynamic_banner(
+                        icon="play_arrow", css="bg-blue-50 text-blue-800", two_lines=True
+                    )
+                elif kind == "schedule_running":
+                    self._dynamic_label, self._dynamic_detail = self._build_dynamic_banner(
+                        icon="event", css="bg-blue-50 text-blue-800", two_lines=True
                     )
                 elif kind == "program_running":
                     # Dynamic (not a static status_banner()) so the
@@ -469,8 +618,30 @@ class DeviceCardView:
                     self._dynamic_label, self._dynamic_detail = self._build_dynamic_banner(
                         icon="schedule", css="bg-blue-50 text-blue-800", two_lines=True
                     )
+                elif kind == "device_task":
+                    self._dynamic_label, self._dynamic_detail = self._build_dynamic_banner(
+                        icon="auto_awesome_motion", css="bg-blue-50 text-blue-800", two_lines=True
+                    )
                 elif kind == "connection_lost":
                     status_banner(t("connection_lost"), kind="danger")
+                elif kind == "taken_over":
+                    status_banner(t("device_taken_over"), kind="warning",
+                                  detail=t("device_taken_over_detail"))
+                elif kind == "used_elsewhere":
+                    status_banner(t("device_used_elsewhere"), kind="warning",
+                                  detail=t("device_used_elsewhere_detail"))
+                    port = device_lock.owner_port(self.dwarf_uid)
+                    if port:
+                        # Same host as this page (phone on the LAN too), the
+                        # owner's port; stopPropagation: not the card's click
+                        url_js = (f"location.protocol + '//' + location.hostname + ':{port}"
+                                  f"/watch/' + encodeURIComponent({self.dwarf_uid!r})")
+                        with ui.row().classes("w-full justify-end"):
+                            ui.button(t("device_open_owner"), icon="open_in_new").props(
+                                "flat dense no-caps"
+                            ).on(
+                                "click", js_handler=f"(e) => {{ e.stopPropagation(); window.open({url_js}, '_blank'); }}"
+                            )
                 elif kind == "disconnected":
                     status_banner(t("disconnected"), kind="warning")
                 else:  # connected
@@ -482,6 +653,9 @@ class DeviceCardView:
 
         # Same kind as last tick: only refresh the bit of text that can
         # legitimately change on its own - no DOM rebuild.
+        if kind != "capturing":
+            self._show_stall(None)
+            capture_stall.forget(self.dwarf_uid)
         if kind == "capturing" and self._dynamic_label is not None:
             is_tele = scheduler_runner.resolve_active_camera_is_tele(self.dwarf_uid, full_status)
             run_state = scheduler_runner.get_run_state(self.dwarf_uid)
@@ -499,19 +673,55 @@ class DeviceCardView:
                 text = t("capture_progress_with_total", current=current, total=total, stacked=stacked)
             else:
                 text = t("capture_progress_no_total", current=current, stacked=stacked)
-            if run_state and run_state.end_time_display:
+            if run_state and run_state.end_time_display and scheduler_runner.is_running(self.dwarf_uid):
                 text += " \u00b7 " + t("card_end_time", time=run_state.end_time_display)
+            elif activity and activity["source"] == "schedule" and activity["end"]:
+                text += " \u00b7 " + t("card_end_time", time=current_activity.format_time(session, activity["end"]))
+            stalled = capture_stall.stalled_minutes(self.dwarf_uid, is_tele, (current, stacked), run_state)
+            self._show_stall(stalled)
             self._dynamic_label.set_text(text)
+            if self._dynamic_detail is not None:
+                self._dynamic_detail.set_text(_activity_title(activity))
+                self._dynamic_detail.set_visibility(bool(activity and activity["target"]))
+        elif kind == "schedule_running" and self._dynamic_label is not None and activity:
+            self._dynamic_label.set_text(_activity_title(activity))
+            if self._dynamic_detail is not None:
+                self._dynamic_detail.set_text(_schedule_detail(session, activity))
+        elif kind == "device_task" and self._dynamic_label is not None and device_task_now:
+            self._dynamic_label.set_text(
+                t("device_task_megastack") if device_task_now["megastack"]
+                else t("device_task_other", name=device_task_now["name"])
+            )
+            if self._dynamic_detail is not None:
+                counts = device_task.megastack_counts(session) if device_task_now["megastack"] else None
+                self._dynamic_detail.set_text(
+                    t("device_task_progress", progress=device_task.megastack_progress_text(counts))
+                    if counts else t("device_task_wait")
+                )
         elif kind == "program_running" and self._dynamic_label is not None:
             run_state = scheduler_runner.get_run_state(self.dwarf_uid)
             name = (run_state.program_name if run_state else "") or t("program_untitled")
+            target = current_activity.program_target(run_state.program if run_state else None)
+            if target and target not in name:
+                name = f"{name} \u00b7 {target}"
             self._dynamic_label.set_text(name)
             if self._dynamic_detail is not None:
                 last_step = run_state.steps[-1].label if run_state and run_state.steps else ""
+                # A megastack: its progress, as for one another app runs
+                megastack_counts = device_task.megastack_counts(session)
+                if megastack_counts:
+                    last_step = device_task.megastack_progress_text(megastack_counts)
                 if run_state and run_state.end_time_display:
                     end_bit = t("card_end_time", time=run_state.end_time_display)
                     last_step = f"{last_step} \u00b7 {end_bit}" if last_step else end_bit
                 self._dynamic_detail.set_text(last_step)
+
+    def _show_stall(self, minutes: int | None) -> None:
+        if self._stall_label is None:
+            return
+        if minutes is not None:
+            self._stall_label.set_text(t("capture_stalled", minutes=minutes))
+        self._stall_label.set_visibility(minutes is not None)
 
     @staticmethod
     def _build_dynamic_banner(
@@ -526,9 +736,11 @@ class DeviceCardView:
         detail_label) tuple instead of a single label - title is the
         program name, detail is the current step, both independently
         mutable without a rebuild."""
-        with ui.row().classes(f"items-center gap-2 rounded-lg px-3 py-2 w-full {css}"):
-            ui.icon(icon).classes("text-lg")
-            with ui.column().classes("gap-0"):
+        # no-wrap: a long target name wraps inside the text column instead
+        # of pushing it under the icon
+        with ui.row().classes(f"items-center gap-2 rounded-lg px-3 py-2 w-full no-wrap {css}"):
+            ui.icon(icon).classes("text-lg shrink-0")
+            with ui.column().classes("gap-0 min-w-0"):
                 if static_message is not None:
                     ui.label(static_message).classes("text-sm font-medium")
                     return ui.label("").classes("text-xs opacity-80")

@@ -18,8 +18,9 @@ import re
 import uuid
 from datetime import datetime, timedelta
 
-from nicegui import run, ui
+from nicegui import app, run, ui
 
+from components.coords import parse_dec_degrees, parse_ra_hours
 from components.camera_settings import (
     _exposure_names,
     _gain_range,
@@ -29,21 +30,35 @@ from components.camera_settings import (
     _ir_filter_table,
 )
 from components.datetime_picker import date_picker_input, time_picker_input
+from components.current_activity import program_target
+from components import end_of_night
 from components.i18n import t
+from components.json_files import write_json_atomic
 from components.session_dirs import ensure_dirs
+from components.site_time import site_now, site_tz
+from components.dso_catalog import (
+    describe as describe_catalog_entry,
+    parse_dec_degrees,
+    parse_ra_hours,
+    short_name,
+)
+from components.eclipsing_binaries import describe as describe_minimum, feature as eclipsing_feature
+from components.eclipsing_planner import open_minima_dialog
 from components.stellarium import get_target_from_stellarium
+from components.target_planner import build_altitude_panel, earliest_start, night_of, open_catalog_dialog
 from dwarf_python_api.get_config_data import config_to_dwarf_id_str
 
 _SOLAR_TARGETS = ["", "Moon", "Mercury", "Venus", "Mars", "Jupiter", "Saturn", "Uranus", "Neptune", "Sun"]
 
 
-def _blank_program() -> dict:
+def _blank_program(config=None) -> dict:
     """Mirrors save_to_json()'s own "data" dict shape exactly, with
     generic wait_before/wait_after (0) and empty/default values -
     astro_dwarf_session's own form reuses ONE wait_before/wait_after
     pair across eq_solving/auto_focus/infinite_focus/calibration, so
-    this editor does too."""
-    now = datetime.now()
+    this editor does too. config: the Dwarf's config - defaults are in
+    its SITE time (components/site_time.py), the scheduler's clock."""
+    now = site_now(config)
     return {
         "command": {
             "id_command": {
@@ -91,18 +106,32 @@ def _blank_program() -> dict:
     }
 
 
+def _refresh_past_date(program: dict, config) -> bool:
+    """An existing program opened with its date/time already past (a result
+    reopened to capture its target again): the date moves to the next
+    occurrence of its time, the time is kept (user-reported Oct 2026: the
+    old date went unnoticed, the program ran at once, and a resume after a
+    network drop then took the old date's end time). True when changed."""
+    id_command = program["command"].setdefault("id_command", {})
+    try:
+        when = datetime.strptime(f"{id_command.get('date', '')} {id_command.get('time', '')}", "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return False
+    now = site_now(config).replace(tzinfo=None)
+    if when > now:
+        return False
+    when = now.replace(hour=when.hour, minute=when.minute, second=when.second, microsecond=0)
+    if when <= now:
+        when += timedelta(days=1)
+    id_command["date"] = when.strftime("%Y-%m-%d")
+    return True
+
+
 def _filename_for(program: dict) -> str:
     id_command = program["command"]["id_command"]
     date = id_command.get("date", "")
     time_str = id_command.get("time", "").replace(":", "-")
-    goto_manual = program["command"]["goto_manual"]
-    goto_solar = program["command"]["goto_solar"]
-    if goto_manual.get("do_action") and goto_manual.get("target"):
-        target = goto_manual["target"]
-    elif goto_solar.get("do_action") and goto_solar.get("target"):
-        target = goto_solar["target"]
-    else:
-        target = id_command.get("description") or "session"
+    target = program_target(program) or "session"
     safe_target = "".join(c if c.isalnum() or c in "-_" else "_" for c in str(target))
     return f"{date}-{time_str}-{safe_target}.json"
 
@@ -111,8 +140,9 @@ def build_program_editor(session, *, initial_program: dict | None = None, on_sav
     """initial_program: load an existing script's dict for editing (None
     = blank template). on_saved(filepath): called after a successful
     save, e.g. to refresh a scripts list."""
-    program = json.loads(json.dumps(initial_program)) if initial_program else _blank_program()
+    program = json.loads(json.dumps(initial_program)) if initial_program else _blank_program(session.config)
     cmd = program["command"]
+    date_refreshed = bool(initial_program) and _refresh_past_date(program, session.config)
 
     # Wrapped in a card (user-reported Sep 2026, native-window
     # screenshot: "couleur identique" - this whole editor was a flat
@@ -127,6 +157,8 @@ def build_program_editor(session, *, initial_program: dict | None = None, on_sav
 
         with ui.row().classes("w-full gap-2 flex-wrap"):
             date_input = date_picker_input(t("prog_date"), cmd["id_command"]["date"]).classes("flex-1 min-w-[140px]")
+            if date_refreshed:
+                ui.notify(t("prog_date_refreshed", date=cmd["id_command"]["date"]), type="info")
             time_input = time_picker_input(
                 t("prog_time"), cmd["id_command"]["time"], with_seconds=True
             ).classes("flex-1 min-w-[140px]")
@@ -137,6 +169,34 @@ def build_program_editor(session, *, initial_program: dict | None = None, on_sav
         with ui.row().classes("w-full gap-2"):
             wait_before_input = ui.number(t("prog_wait_before"), value=cmd["auto_focus"]["wait_before"], min=0).classes("flex-1")
             wait_after_input = ui.number(t("prog_wait_after"), value=cmd["auto_focus"]["wait_after"], min=0).classes("flex-1")
+
+        # Start position and what follows the session (components/end_of_night.py)
+        end_session = cmd["id_command"].get("end_session") or {}
+        exit_default = end_of_night.get_settings(session.dwarf_uid)["exit"]
+        with ui.row().classes("w-full gap-x-4 gap-y-1 items-center flex-wrap"):
+            start_position_select = ui.select(
+                {end_of_night.START_NONE: t("prog_start_none"), end_of_night.START_SAVED: t("prog_start_saved"),
+                 end_of_night.START_POLAR: t("prog_start_polar")},
+                value=cmd["id_command"].get("start_position") or end_of_night.START_NONE,
+                label=t("prog_start_position"),
+            ).classes("min-w-56")
+            ui.icon("info").classes("text-grey-6").tooltip(t("prog_start_position_hint"))
+        with ui.row().classes("w-full gap-x-4 gap-y-1 items-center flex-wrap"):
+            exit_mode_select = ui.select(
+                {end_of_night.OVERRIDE_DEFAULT: t("prog_exit_default"), end_of_night.OVERRIDE_ON: t("prog_exit_on"),
+                 end_of_night.OVERRIDE_OFF: t("prog_exit_off")},
+                value=end_session.get("mode") or end_of_night.OVERRIDE_DEFAULT,
+                label=t("prog_exit_label"),
+            ).classes("min-w-56")
+            exit_after_input = ui.number(
+                t("eon_after_min"), value=end_session.get("after_min", exit_default["after_min"]),
+                min=0, max=240, step=1, format="%d",
+            ).classes("w-28")
+            exit_stop_cb = ui.checkbox(t("eon_stop_tracking"),
+                                       value=bool(end_session.get("stop_tracking", exit_default["stop_tracking"])))
+            ui.icon("info").classes("text-grey-6").tooltip(t("prog_exit_hint"))
+            for element in (exit_after_input, exit_stop_cb):
+                element.bind_visibility_from(exit_mode_select, "value", value=end_of_night.OVERRIDE_ON)
 
         ui.label(t("prog_actions")).classes("text-sm text-grey-6 mt-2")
         with ui.row().classes("w-full justify-between gap-4"):
@@ -173,12 +233,27 @@ def build_program_editor(session, *, initial_program: dict | None = None, on_sav
             solar_target = ui.select(_SOLAR_TARGETS, value=cmd["goto_solar"]["target"], label=t("prog_solar_target")).classes("w-full")
 
         with ui.column().classes("w-full gap-2") as manual_section:
-            with ui.row().classes("w-full justify-between gap-2"):
-                manual_target = ui.input(t("prog_target_name"), value=cmd["goto_manual"]["target"]).classes("flex-1")
-                ra_input = ui.input(t("prog_ra"), value=str(cmd["goto_manual"]["ra_coord"] or "")).classes("w-32")
-                dec_input = ui.input(t("prog_dec"), value=str(cmd["goto_manual"]["dec_coord"] or "")).classes("w-32")
+            # min-w on the name: on a phone it wraps onto its own full-width line
+            # instead of being squeezed to a few characters; RA/Dec (~9 chars each)
+            # stay together on the next line.
+            with ui.row().classes("w-full gap-2 flex-wrap"):
+                manual_target = ui.input(t("prog_target_name"), value=cmd["goto_manual"]["target"]).classes("flex-1 min-w-[240px]")
+                with ui.row().classes("gap-2 no-wrap"):  # RA/Dec wrap together
+                    # Decimal or sexagesimal ("18h 13m 40.3s", "-17° 36' 06\"", "18:13:40"...),
+                    # saved as decimal hours / degrees (components/coords.py)
+                    ra_input = ui.input(
+                        t("prog_ra"), value=str(cmd["goto_manual"]["ra_coord"] or ""),
+                        validation={t("prog_ra_invalid"): lambda v: not v or parse_ra_hours(v) is not None},
+                    ).classes("w-36").tooltip(t("prog_ra_hint"))
+                    dec_input = ui.input(
+                        t("prog_dec"), value=str(cmd["goto_manual"]["dec_coord"] or ""),
+                        validation={t("prog_dec_invalid"): lambda v: not v or parse_dec_degrees(v) is not None},
+                    ).classes("w-36").tooltip(t("prog_dec_hint"))
 
             stellarium_status = ui.label("").classes("text-xs")
+            # Where the target came from: "catalog" (already kept), else it can
+            # be kept in "my objects" on save (user-requested Oct 2026, #162)
+            target_origin = {"source": "manual", "type": "", "mag": None}
 
             async def _fetch_from_stellarium() -> None:
                 stellarium_status.set_text(t("prog_stellarium_fetching"))
@@ -198,13 +273,163 @@ def build_program_editor(session, *, initial_program: dict | None = None, on_sav
                 dec_input.value = str(target.dec_degrees)
                 description.value = target.description
                 goto_mode.value = "manual"
+                target_origin.update(source="stellarium", type="", mag=None)
                 _update_goto_visibility()
                 stellarium_status.set_text(t("prog_stellarium_fetched", name=target.target_name))
                 stellarium_status.classes(replace="text-xs text-green-700")
+                _refresh_altitude(open_panel=True)
 
-            ui.button(
-                t("prog_get_from_stellarium"), icon="explore", on_click=_fetch_from_stellarium
-            ).props("flat dense")
+            # Second target source next to Stellarium (user-requested Oct
+            # 2026): the DSO catalog shared with Dwarfium Scope Archive -
+            # see components/dso_catalog.py for where it's read from.
+            def _apply_catalog_entry(entry: dict) -> None:
+                name = short_name(entry)
+                manual_target.value = name
+                ra_input.value = f"{entry['ra_hours']:.6f}"
+                dec_input.value = f"{entry['dec_deg']:.6f}"
+                description.value = describe_catalog_entry(entry)
+                goto_mode.value = "manual"
+                target_origin.update(source="recent" if entry.get("_recentOnly") else "catalog", type="", mag=None)
+                _update_goto_visibility()
+                stellarium_status.set_text(t("prog_stellarium_fetched", name=name))
+                stellarium_status.classes(replace="text-xs text-green-700")
+                _refresh_altitude(open_panel=True)
+
+            # An eclipsing binary's next minimum (user-requested Oct 2026,
+            # components/eclipsing_binaries.py): the star, and the window
+            # around its minimum as start / end time - measured afterwards
+            # in Siril or AstroImageJ.
+            def _apply_minimum(minimum) -> None:
+                star = minimum.star
+                manual_target.value = minimum.name
+                ra_input.value = f"{float(star['ra_hours']):.6f}"
+                dec_input.value = f"{float(star['dec_deg']):.6f}"
+                description.value = describe_minimum(minimum)
+                goto_mode.value = "manual"
+                target_origin.update(source="variable-star", type="Variable Star", mag=star.get("mag"))
+                _update_goto_visibility()
+                if camera_choice.value == "none":
+                    camera_choice.value = "tele"
+                stellarium_status.set_text(t("prog_stellarium_fetched", name=minimum.name))
+                stellarium_status.classes(replace="text-xs text-green-700")
+                _apply_slot(minimum.window_start, minimum.window_end)
+                _refresh_altitude(open_panel=True)
+                # The filter cutting the infrared, which the sensor's green
+                # pixels let through a bit (user-confirmed Oct 2026: VIS on the
+                # D3, IR cut on the D2); the Mini has neither
+                photometry_filter = {"3": "VIS Filter", "2": "IR_CUT"}.get(dwarf_type)
+                if photometry_filter in _ir_filter_names(dwarf_type):
+                    ir_filter_input.value = photometry_filter
+                    ui.notify(t("eb_filter_set", name=photometry_filter))
+                ui.notify(t("eb_exposure_hint"), type="info", multi_line=True, timeout=12000)
+
+            # On a phone the icon stays left of its text, which wraps beside
+            # it (user-reported Oct 2026: the variable star button's text
+            # under its icon - longer still in French)
+            ui.add_css(".icon-beside .q-btn__content { flex-wrap: nowrap; text-align: left; }")
+            with ui.row().classes("gap-2"):
+                ui.button(
+                    t("prog_get_from_stellarium"), icon="explore", on_click=_fetch_from_stellarium
+                ).props("flat dense").classes("icon-beside")
+                ui.button(
+                    t("prog_pick_from_catalog"),
+                    icon="menu_book",
+                    on_click=lambda: open_catalog_dialog(
+                        session, _apply_catalog_entry, _current_night, tz=site_tz(session.config)
+                    ),
+                ).props("flat dense").classes("icon-beside")
+                # Shown once turned on from the Programs page's top-right button
+                ui.button(
+                    t("prog_pick_eclipse"),
+                    icon="contrast",
+                    on_click=lambda: open_minima_dialog(
+                        session, _apply_minimum, _current_night, tz=site_tz(session.config)
+                    ),
+                ).props("flat dense").classes("icon-beside").bind_visibility_from(eclipsing_feature, "enabled")
+
+            # A target from Stellarium, typed in, a variable star or a recent
+            # one: kept in "my objects" on save if ticked (the choice
+            # remembered) - not shown for a catalog object, kept already
+            keep_cb = ui.checkbox(
+                t("prog_keep_my_objects"), value=bool(app.storage.general.get("keep_my_objects", False))
+            ).props("dense").classes("text-sm").tooltip(t("prog_keep_my_objects_hint"))
+
+            def _on_target_typed(_e=None) -> None:
+                target_origin.update(source="manual", type="", mag=None)
+                keep_cb.set_visibility(True)
+
+            manual_target.on_value_change(_on_target_typed)
+            # An edited program whose target the catalog has: nothing to keep
+            from components.catalog_add_on import known_object
+            if cmd["goto_manual"].get("target") and known_object(
+                    cmd["goto_manual"]["target"], cmd["goto_manual"].get("ra_coord"), cmd["goto_manual"].get("dec_coord")):
+                target_origin["source"] = "catalog"
+
+            # Altitude over the night + best slot (user-requested Oct
+            # 2026: "voir sa hauteur dans le ciel pour choisir le
+            # meilleur creneau"). end_time_input is created further down
+            # - fine, _apply_slot() only runs on a later click.
+            def _current_target() -> tuple[float, float] | None:
+                ra_text = str(ra_input.value or "").strip()
+                dec_text = str(dec_input.value or "").strip()
+                if not ra_text or not dec_text:
+                    return None
+                try:
+                    ra = float(ra_text)
+                except ValueError:
+                    ra = parse_ra_hours(ra_text)
+                try:
+                    dec = float(dec_text)
+                except ValueError:
+                    dec = parse_dec_degrees(dec_text)
+                if ra is None or dec is None or not -90 <= dec <= 90:
+                    return None
+                return ra % 24, dec
+
+            def _current_night() -> datetime:
+                return night_of(date_input.value, time_input.value)
+
+            def _apply_slot(start: datetime, end: datetime | None) -> None:
+                # A start already past becomes now + 5 min (site time)
+                start = earliest_start(start, site_now(session.config))
+                if end is not None and start >= end:
+                    ui.notify(t("planner_slot_over", end=f"{end:%H:%M}"), type="warning")
+                    return
+                date_input.value = start.strftime("%Y-%m-%d")
+                time_input.value = start.strftime("%H:%M:%S")
+                if end is None:
+                    ui.notify(t("planner_start_applied", start=f"{start:%Y-%m-%d %H:%M}"))
+                    return
+                end_time_input.value = end.strftime("%H:%M")
+                # Image count filling the slot (user-reported Oct 2026: it
+                # stayed at the default 20, so the program stopped long
+                # before the chosen end time)
+                count = _count_for_duration((end - start).total_seconds())
+                if count is None:
+                    ui.notify(t("planner_slot_applied", start=f"{start:%H:%M}", end=f"{end:%H:%M}"))
+                    return
+                _set_total_count(count)
+                ui.notify(t("planner_slot_applied_count", start=f"{start:%H:%M}", end=f"{end:%H:%M}",
+                            count=int(count_input.value or 0)))
+
+            altitude_panel, _refresh_altitude_chart = build_altitude_panel(
+                session,
+                get_target=_current_target,
+                get_night=_current_night,
+                apply_slot=_apply_slot,
+                tz=site_tz(session.config),
+            )
+
+            def _refresh_altitude(open_panel: bool = False) -> None:
+                _refresh_altitude_chart()
+                if open_panel and _current_target() is not None:
+                    altitude_panel.open()
+
+            ra_input.on_value_change(lambda _: _refresh_altitude())
+            dec_input.on_value_change(lambda _: _refresh_altitude())
+            date_input.on_value_change(lambda _: _refresh_altitude())
+            time_input.on_value_change(lambda _: _refresh_altitude())
+            _refresh_altitude()
 
         wait_after_target_input = ui.number(
             t("prog_wait_after_target"), value=cmd["goto_solar"]["wait_after"], min=0
@@ -213,6 +438,7 @@ def build_program_editor(session, *, initial_program: dict | None = None, on_sav
         def _update_goto_visibility() -> None:
             solar_section.set_visibility(goto_mode.value == "solar")
             manual_section.set_visibility(goto_mode.value == "manual")
+            keep_cb.set_visibility(target_origin["source"] != "catalog")
 
         goto_mode.on_value_change(lambda _: _update_goto_visibility())
         _update_goto_visibility()
@@ -331,16 +557,29 @@ def build_program_editor(session, *, initial_program: dict | None = None, on_sav
             # erroring.
             duration_estimate_label = ui.label("").classes("text-xs text-grey-6 self-center")
 
-        def _update_duration_estimate() -> None:
+        def _exposure_seconds() -> float | None:
+            """Selected exposure in seconds ("30", "1/2"...), None if unparsable."""
             try:
-                exposure_seconds = float(exposure_input.value)
+                return float(exposure_input.value)
             except (TypeError, ValueError):
                 try:
                     num, denom = str(exposure_input.value).split("/")
-                    exposure_seconds = float(num) / float(denom)
+                    return float(num) / float(denom)
                 except (TypeError, ValueError, ZeroDivisionError):
-                    duration_estimate_label.set_text("")
-                    return
+                    return None
+
+        def _count_for_duration(seconds: float) -> int | None:
+            """Number of exposures fitting in `seconds` (at least 1)."""
+            exposure_seconds = _exposure_seconds()
+            if not exposure_seconds or exposure_seconds <= 0:
+                return None
+            return max(1, int(seconds // exposure_seconds))
+
+        def _update_duration_estimate() -> None:
+            exposure_seconds = _exposure_seconds()
+            if exposure_seconds is None:
+                duration_estimate_label.set_text("")
+                return
 
             count = int(count_input.value or 0)
             total_seconds = int(exposure_seconds * count)
@@ -450,6 +689,24 @@ def build_program_editor(session, *, initial_program: dict | None = None, on_sav
                 return 2
             return 1
 
+        def _current_panels() -> int:
+            try:
+                fx_pct = int(round(float(framing_x_input.value or 1.0) * 100))
+                fy_pct = int(round(float(framing_y_input.value or 1.0) * 100))
+            except (TypeError, ValueError):
+                fx_pct = fy_pct = 100
+            return _panel_count(fx_pct, fy_pct)
+
+        def _set_total_count(total: int) -> None:
+            """Sets the number of images to take: count_input, or for a
+            real mosaic (count locked to panels x per view) the count per
+            view."""
+            panels = _current_panels() if camera_choice.value == "tele" and mosaic_cb.value else 1
+            if panels > 1:
+                mosaic_count_input.value = max(1, total // panels)
+            else:
+                count_input.value = total
+
         def _sync_mosaic_stack_count() -> None:
             """User-requested (Sep 2026): in the official app, the total
             "subframes to stack" count for a Mosaic session isn't
@@ -476,12 +733,7 @@ def build_program_editor(session, *, initial_program: dict | None = None, on_sav
             if not in_mosaic:
                 count_input.enable()
                 return
-            try:
-                fx_pct = int(round(float(framing_x_input.value or 1.0) * 100))
-                fy_pct = int(round(float(framing_y_input.value or 1.0) * 100))
-            except (TypeError, ValueError):
-                fx_pct = fy_pct = 100
-            panels = _panel_count(fx_pct, fy_pct)
+            panels = _current_panels()
             per_view = int(mosaic_count_input.value or 0)
             count_input.value = panels * per_view
             if panels == 1:
@@ -605,6 +857,11 @@ def build_program_editor(session, *, initial_program: dict | None = None, on_sav
                 missing.append(t("prog_solar_target"))
             if goto_mode.value == "manual" and not (manual_target.value and ra_input.value and dec_input.value):
                 missing.append(t("prog_goto_manual"))
+            elif goto_mode.value == "manual" and (
+                parse_ra_hours(ra_input.value) is None or parse_dec_degrees(dec_input.value) is None
+            ):
+                # Unreadable coordinates used to be saved empty, silently
+                missing.append(t("prog_goto_coords_invalid"))
             # Optional "end_time" (HH:MM, 24h) - blank is valid (no
             # scheduled early stop at all, the default), so this only
             # rejects a NON-blank value that isn't actually HH:MM -
@@ -656,11 +913,8 @@ def build_program_editor(session, *, initial_program: dict | None = None, on_sav
                 is_tele and mosaic_cb.value and not (framing_x_pct == 100 and framing_y_pct == 100)
             )
 
-            def _coord(value: str):
-                try:
-                    return float(value)
-                except (TypeError, ValueError):
-                    return ""
+            def _coord(value: float | None):
+                return round(value, 6) if value is not None else ""
 
             return {
                 "id_command": {
@@ -669,6 +923,12 @@ def build_program_editor(session, *, initial_program: dict | None = None, on_sav
                     "date": date_input.value.strip(),
                     "time": time_input.value.strip(),
                     "max_retries": int(retries_input.value or 3),
+                    "start_position": start_position_select.value or end_of_night.START_NONE,
+                    "end_session": {
+                        "mode": exit_mode_select.value or end_of_night.OVERRIDE_DEFAULT,
+                        "after_min": int(exit_after_input.value or 0),
+                        "stop_tracking": bool(exit_stop_cb.value),
+                    },
                 },
                 "eq_solving": {
                     "do_action": eq_solving_cb.value,
@@ -698,8 +958,8 @@ def build_program_editor(session, *, initial_program: dict | None = None, on_sav
                 "goto_manual": {
                     "do_action": goto_mode.value == "manual",
                     "target": manual_target.value if goto_mode.value == "manual" else "",
-                    "ra_coord": _coord(ra_input.value) if goto_mode.value == "manual" else "",
-                    "dec_coord": _coord(dec_input.value) if goto_mode.value == "manual" else "",
+                    "ra_coord": _coord(parse_ra_hours(ra_input.value)) if goto_mode.value == "manual" else "",
+                    "dec_coord": _coord(parse_dec_degrees(dec_input.value)) if goto_mode.value == "manual" else "",
                     "wait_after": int(wait_after_target_input.value or 0),
                 },
                 "setup_camera": {
@@ -737,10 +997,21 @@ def build_program_editor(session, *, initial_program: dict | None = None, on_sav
             dirs = ensure_dirs(session)
             filename = _filename_for(new_program)
             filepath = os.path.join(dirs["TODO_DIR"], filename)
-            with open(filepath, "w", encoding="utf-8") as f:
-                json.dump(new_program, f, indent=4)
+            write_json_atomic(filepath, new_program)
 
             message = t("prog_saved", filename=filename)
+            if goto_mode.value == "manual" and keep_cb.visible:
+                app.storage.general["keep_my_objects"] = bool(keep_cb.value)
+                if keep_cb.value:
+                    from components import catalog_add_on
+                    goto = new_cmd["goto_manual"]
+                    try:
+                        added, name = catalog_add_on.add_target(
+                            goto["target"], goto["ra_coord"], goto["dec_coord"], target_origin["source"],
+                            type_name=target_origin["type"], magnitude=target_origin["mag"])
+                        message += " " + t("my_objects_added" if added else "my_objects_known", name=name)
+                    except (OSError, ValueError, TypeError) as e:
+                        message += " " + t("my_objects_not_saved", error=e)
             # Soft, non-blocking heads-up: mosaic was checked but both
             # framings are 1.00x, so _collect_cmd() already saved it as
             # a normal (non-mosaic) session - matching what dwarf_
@@ -809,8 +1080,7 @@ def build_program_editor(session, *, initial_program: dict | None = None, on_sav
             for program in programs:
                 filename = _filename_for(program)
                 filepath = os.path.join(dirs["TODO_DIR"], filename)
-                with open(filepath, "w", encoding="utf-8") as f:
-                    json.dump(program, f, indent=4)
+                write_json_atomic(filepath, program)
 
             telescopius_status.set_text(
                 t("prog_telescopius_generated", count=len(programs), format=fmt)

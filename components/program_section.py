@@ -22,7 +22,9 @@ from __future__ import annotations
 
 from nicegui import events, ui
 
-from components import scheduler_runner
+from components import device_task, scheduler_runner
+from components.megastack import megastack_section
+from pages.explorer import _format_duration
 from components.i18n import t
 
 _STATUS_ICON = {"success": "check_circle", "failed": "cancel"}
@@ -72,6 +74,8 @@ def build_program_section(session) -> None:
         running_name_label.set_visibility(False)
 
         progress_container = ui.column().classes("w-full gap-1 mt-2")
+        # A megastack's stack so far: in the Tele frame (components/
+        # camera_stream.py), not here (user-requested Oct 2026)
 
         def render_progress() -> None:
             progress_container.clear()
@@ -87,11 +91,13 @@ def build_program_section(session) -> None:
                 if state is None:
                     return
                 for step in state.steps:
-                    with ui.row().classes("items-center gap-2"):
+                    # no-wrap: a long label (a megastack's result folder)
+                    # wraps itself, not below its icon (user-seen)
+                    with ui.row().classes("items-center gap-2 no-wrap"):
                         ui.icon(_STATUS_ICON.get(step.status, "circle")).classes(
-                            f"text-base {_STATUS_COLOR.get(step.status, '')}"
+                            f"text-base shrink-0 {_STATUS_COLOR.get(step.status, '')}"
                         )
-                        ui.label(step.label).classes("text-xs")
+                        ui.label(step.label).classes("text-xs min-w-0 break-all")
                 if state.running:
                     with ui.row().classes("items-center gap-2"):
                         ui.spinner(size="1em")
@@ -115,7 +121,28 @@ def build_program_section(session) -> None:
                 # Error JSON file). Only meaningful once finished (best-
                 # effort read AFTER the capture completes, same as the
                 # Results tab) - blank while state.running.
-                if state.shots_taken:
+                # A megastack: its progress line, as on the other screens
+                # (device_task.megastack_progress_text), not a capture's
+                # counts
+                megastack_counts = device_task.megastack_counts(session)
+                command = (state.program or {}).get("command", state.program or {})
+                is_megastack = bool(megastack_section(command))
+                if megastack_counts:
+                    ui.label(device_task.megastack_progress_text(megastack_counts)).classes(
+                        "text-xs text-grey-6"
+                    )
+                elif is_megastack:
+                    # Done: its counts and total exposure (its FITS), no
+                    # camera settings - none were used
+                    bits = []
+                    if state.shots_taken:
+                        bits.append(f"{state.shots_stacked or 0}/{state.shots_taken} {t('prog_shots_stacked')}")
+                    exposure = (command.get("id_command") or {}).get("total_exposure_s")
+                    if exposure:
+                        bits.append(f"{t('prog_total_exposure')}: {_format_duration(exposure)}")
+                    if bits:
+                        ui.label(" \u00b7 ".join(bits)).classes("text-xs text-grey-6")
+                elif state.shots_taken:
                     ui.label(
                         f"{state.shots_stacked or 0}/{state.shots_taken} {t('prog_shots_stacked')}"
                     ).classes("text-xs text-grey-6")
@@ -127,7 +154,9 @@ def build_program_section(session) -> None:
                 # this program's setup_camera/setup_wide_camera do_
                 # action actually was).
                 total = state.requested_count_tele or state.requested_count_wide
-                if state.exposure_actual or state.gain_actual or state.ir_filter_actual or total:
+                if not megastack_counts and not is_megastack and (
+                    state.exposure_actual or state.gain_actual or state.ir_filter_actual or total
+                ):
                     bits = []
                     if state.exposure_actual:
                         bits.append(f"{t('exposure')}: {state.exposure_actual}")

@@ -15,9 +15,46 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import tzinfo
 from pathlib import Path
 
+from components.site_time import site_tz
+import dwarf_python_api.proto.protocol_pb2 as protocol
+
 CACHE_FILE = Path("native_schedule_cache.json")
+
+def schedule_tz(config) -> tzinfo:
+    """Timezone used to type AND display native-schedule times for one
+    device: its configured `timezone` (the Site's, the same one
+    perform_timezone() pushes to the Dwarf), so a time entered in the
+    schedule editor is the time the device actually shoots at. Falls back
+    to this PC's local timezone when the setting is empty or unknown -
+    see components/site_time.py, shared with the program scheduler."""
+    return site_tz(config)
+
+
+def error_code_name(code) -> str | None:
+    """Short name of a device error code, e.g. -16310 -> "SHOOTING_SCHEDULE_
+    INTERRUPTED" (DwarfErrorCode, "CODE_" prefix dropped); None for 0/None,
+    the bare number if unknown."""
+    if not code:
+        return None
+    try:
+        return protocol.DwarfErrorCode.Name(code).removeprefix("CODE_")
+    except ValueError:
+        return str(code)
+
+
+# Task error codes shown as a warning, not an error (user-requested Oct
+# 2026): -1 (WS_PARSE_PROTOBUF_ERROR) ends tasks whose stack was saved
+# anyway (DwarfLab's analysis), and "PROTOBUF error" looked alarming.
+WARNING_ERROR_CODES = {-1}
+
+
+def is_warning(task: dict) -> bool:
+    """True for a task whose error code is only a warning (see above)."""
+    return task.get("error_code") in WARNING_ERROR_CODES
+
 
 SCHEDULE_STATE_LABELS = {
     0: "initialized", 1: "pending", 2: "shooting", 3: "completed", 4: "expired",
@@ -45,6 +82,12 @@ def parse_native_schedule_info(info) -> list[dict]:
             tasks.append({
                 "name": p.get("name", "?"),
                 "state_code": task.state,
+                # Why a task failed / was interrupted, as recorded by the
+                # device (e.g. -16310 INTERRUPTED when the Dwarf was off or
+                # unavailable at start time, -11504 calibration failed).
+                "error_code": task.code or None,
+                "error_name": error_code_name(task.code),
+                "warning": task.code in WARNING_ERROR_CODES,
                 "startTime": p.get("startTime"),
                 "endTime": p.get("endTime"),
                 "shutterName": p.get("shutterName"),
@@ -52,12 +95,18 @@ def parse_native_schedule_info(info) -> list[dict]:
                 "filterModeName": p.get("filterModeName"),
                 "count": p.get("count"),
                 "stacked": p.get("stacked"),
+                "isMosaic": p.get("isMosaicMode"),
+                "horizontalScale": p.get("horizontalScale"),
+                "verticalScale": p.get("verticalScale"),
             })
         recency = sched.updated_time or sched.created_time or sched.schedule_time or 0
         parsed.append({
             "scheduleId": sched.schedule_id,
             "name": sched.schedule_name or sched.schedule_id,
             "state_code": sched.state,
+            # ShootingScheduleResult: 0 pending, 1 all completed,
+            # 2 partially completed, 3 all failed.
+            "result_code": sched.result,
             "startTime": sched.start_time or None,
             "endTime": sched.end_time or None,
             "tasks": tasks,
@@ -107,3 +156,36 @@ def remove_from_cache(dwarf_uid: str, schedule_id: str) -> None:
         return
     entry["schedule"] = [s for s in entry["schedule"] if s.get("scheduleId") != schedule_id]
     _write_cache_file(_store)
+
+
+def _epoch_s(value) -> int | None:
+    """Epoch seconds from seconds or milliseconds."""
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return None
+    return value // 1000 if value > 10_000_000_000 else value
+
+
+def upcoming_tasks(dwarf_uid: str, now: float | None = None) -> list[dict]:
+    """Tasks of the cached on-device schedules still to come or running
+    (not ended, not done/failed), sorted by start: {"schedule", "name",
+    "start", "end" (epoch s), "state_code"}. For the schedule editor's
+    reminder of what is already planned on the Dwarf."""
+    now = now if now is not None else time.time()
+    out = []
+    for sched in get_cached(dwarf_uid) or []:
+        if sched.get("state_code") in (3, 4):  # completed, expired
+            continue
+        for task in sched.get("tasks") or []:
+            start, end = _epoch_s(task.get("startTime")), _epoch_s(task.get("endTime"))
+            if start is None or end is None or end <= now or task.get("state_code") in (2, 3, 4):
+                continue
+            out.append({
+                "schedule": sched.get("name") or "",
+                "name": task.get("name") or "",
+                "start": start,
+                "end": end,
+                "state_code": task.get("state_code"),
+            })
+    return sorted(out, key=lambda tk: tk["start"])

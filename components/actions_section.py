@@ -7,10 +7,11 @@ every ~2s poll tick, along with any button mid-interaction.
 Toggle Lights / Focus Infinite / Calibrate / Polar Position / EQ Solving
 / Reboot are ported from astro_dwarf_session_UI.py's own buttons -
 verified against that source, not guessed:
-- Toggle Lights: perform_powerOpenRGB()/perform_powerCloseRGB() - there's
-  no status field to read the light's current state back from the
-  device, so this module tracks it itself (in-memory, per dwarf_uid,
-  reset on app restart).
+- Toggle Lights: perform_powerOpenRGB()/perform_powerCloseRGB() - the
+  light's current state is read first as the Dwarf reports it (its RGB
+  notification, else rgb_state in the device state on connection - see
+  components/identify.py), the state remembered after our own commands
+  being only a fallback. Same for the power indicator.
 - Focus Infinite: perform_start_autofocus(infinite=True, ...).
 - Calibrate: perform_calibration().
 - Polar Position: NOT a single perform_* call - astro_dwarf_session_UI.
@@ -48,13 +49,13 @@ from dwarf_python_api.lib.dwarf_utils import (
     start_polar_align,
 )
 
-from components import connection_health
+from components import connection_health, end_of_night, scheduler_runner
 from components.i18n import t
 
-# In-memory only - no field in get_client_status()'s fullStatus reports
-# the RGB light's current on/off state, so there's nothing to read back
-# from the device to stay in sync with. Resets to "assumed off" on app
-# restart.
+# The state remembered after our own commands - only a fallback now: the
+# Dwarf reports both lights (RGB / power indicator notifications, and
+# rgb_state / power_ind_state in the device state on connection), read
+# first by _current() (Oct 2026). Resets to "assumed off" on app restart.
 _lights_on: dict[str, bool] = {}
 # Power indicator LED (user-requested Sep 2026: "eteindre les lumieres
 # de la battery" - separate from _lights_on above, which is the main
@@ -79,14 +80,10 @@ def _build_eq_result_panel(session) -> Callable[[], None]:
     the azimuth/altitude knob to CORRECT the error, not which way the
     error itself points.
 
-    PER-MODEL (Sep 2026, field-tested): the sign convention is NOT the
-    same between Mini and Dwarf 3 - a real Mini test showed the
-    ORIGINAL (un-flipped) mapping already correct (turning the knob the
-    way that icon pointed reduced the error), while a real Dwarf 3 test
-    showed the OPPOSITE - the flipped mapping was needed there. Dwarf II
-    user-confirmed (Sep 2026) to share the same mechanism as D3, so it
-    gets the same flipped mapping - not independently tested on a real
-    D2 unit, but a direct statement about the hardware, not a guess.
+    Same sign convention on every model (user-reported Oct 2026: the
+    Sep 2026 per-model flip for Dwarf 3 / Dwarf II made the D3 indicator
+    point the wrong way - the Mini's mapping, already right, is right on
+    the D3 too, so D2, D3 and Mini share it).
     Absolute value still shown (sign is conveyed by the icon/colour, not
     by a +/- prefix), matching Dwarfium's own Math.abs(...).toFixed(2).
 
@@ -114,16 +111,7 @@ def _build_eq_result_panel(session) -> Callable[[], None]:
             return
         panel.set_visibility(True)
 
-        # See this function's own docstring - D3 needs the flipped
-        # (correction-direction) mapping; Mini (and, unconfirmed, D2)
-        # use the original error-direction mapping as-is.
-        # See this function's own docstring - D2 and D3 share the same
-        # mechanism (user-confirmed Sep 2026) and both need the flipped
-        # (correction-direction) mapping; Mini uses the original error-
-        # direction mapping as-is.
-        needs_flip = config_to_dwarf_id_int(session.config.dwarf_model_id) in (2, 3)
-
-        if (azi_err > 0) != needs_flip:
+        if azi_err > 0:
             azi_icon.name = "rotate_right"
             azi_icon.classes(replace="text-lg text-positive")
         else:
@@ -131,7 +119,7 @@ def _build_eq_result_panel(session) -> Callable[[], None]:
             azi_icon.classes(replace="text-lg text-negative")
         azi_label.set_text(f"{abs(azi_err):.2f}\u00b0 {t('action_eq_solving_azimuth')}")
 
-        if (alt_err > 0) != needs_flip:
+        if alt_err > 0:
             alt_icon.name = "arrow_upward"
             alt_icon.classes(replace="text-lg text-positive")
         else:
@@ -149,6 +137,7 @@ async def _run_and_notify(
     *,
     success_message: str,
     success_message_fn: Callable[[], str] | None = None,
+    failure_message: str | None = None,
     refresh_view=None,
     display_duration: float = 2.0,
     **kwargs,
@@ -193,7 +182,7 @@ async def _run_and_notify(
         notification.message = success_message_fn() if success_message_fn else success_message
         notification.type = "positive"
     else:
-        notification.message = t("command_failed")
+        notification.message = failure_message or t("command_failed")
         notification.type = "negative"
     if refresh_view:
         refresh_view()
@@ -246,25 +235,40 @@ def _polar_position_sequence(session) -> bool:
         return bool(motor_action(3, session=session))  # Pitch positioning
 
 
+async def _send_light(session, dwarf_uid, fn):
+    """Sends one light command: with the command slot, taking priority
+    over the periodic connection check, or without it while a program
+    captures (scheduler_runner.program_capturing() - user-requested Oct
+    2026: the lights stayed "device busy" for the whole program). None
+    when the device is busy (notified), else the command's result."""
+    acquired = connection_health.acquire_with_priority(dwarf_uid, caller="actions.lights")
+    if not acquired and not scheduler_runner.program_capturing(session):
+        ui.notify(t("device_busy"), type="warning")
+        return None
+    try:
+        return await run.io_bound(fn, session=session)
+    finally:
+        if acquired:
+            connection_health.release_command_slot(dwarf_uid)
+
+
+def _current(reported: bool | None, remembered: dict, dwarf_uid: str) -> bool:
+    """A light's state before toggling it: as the Dwarf reports it
+    (user-requested Oct 2026 - the remembered one was wrong whenever the
+    light was switched elsewhere, or on at start), else as remembered."""
+    return reported if reported is not None else remembered.get(dwarf_uid, False)
+
+
 async def _handle_toggle_lights(session, dwarf_uid) -> None:
-    is_on = _lights_on.get(dwarf_uid, False)
+    from components.identify import _light_is_on
+    is_on = _current(_light_is_on(session), _lights_on, dwarf_uid)
     fn = perform_powerCloseRGB if is_on else perform_powerOpenRGB
 
-    # Same priority-over-health_check reasoning as _run_and_notify()
-    # above - see that function's own comment.
-    connection_health.mark_priority_pending(dwarf_uid)
-    try:
-        acquired = connection_health.try_acquire_command_slot(dwarf_uid)
-    finally:
-        connection_health.clear_priority_pending(dwarf_uid)
-    if not acquired:
-        ui.notify(t("device_busy"), type="warning")
+    # Also during a program's capture, without the slot (user-requested
+    # Oct 2026) - see _send_light().
+    result = await _send_light(session, dwarf_uid, fn)
+    if result is None:
         return
-    try:
-        result = await run.io_bound(fn, session=session)
-    finally:
-        connection_health.release_command_slot(dwarf_uid)
-
     # is not False, not a plain truthy check - perform_powerOpenRGB/
     # perform_powerCloseRGB return the raw response value (>= 0) on
     # success via get_result_value(), and 0 is a valid success value
@@ -277,24 +281,15 @@ async def _handle_toggle_lights(session, dwarf_uid) -> None:
 
 
 async def _handle_toggle_power_lights(session, dwarf_uid) -> None:
-    is_on = _power_lights_on.get(dwarf_uid, False)
+    from components.identify import power_light_is_on
+    is_on = _current(power_light_is_on(session), _power_lights_on, dwarf_uid)
     fn = perform_powerIndOff if is_on else perform_powerIndOn
 
-    # Same priority-over-health_check reasoning as _run_and_notify()
-    # above - see that function's own comment.
-    connection_health.mark_priority_pending(dwarf_uid)
-    try:
-        acquired = connection_health.try_acquire_command_slot(dwarf_uid)
-    finally:
-        connection_health.clear_priority_pending(dwarf_uid)
-    if not acquired:
-        ui.notify(t("device_busy"), type="warning")
+    # Also during a program's capture, without the slot (user-requested
+    # Oct 2026) - see _send_light().
+    result = await _send_light(session, dwarf_uid, fn)
+    if result is None:
         return
-    try:
-        result = await run.io_bound(fn, session=session)
-    finally:
-        connection_health.release_command_slot(dwarf_uid)
-
     if result is not False:
         _power_lights_on[dwarf_uid] = not is_on
         ui.notify(
@@ -322,6 +317,45 @@ async def _handle_reboot(session, dwarf_uid) -> None:
     dialog.open()
 
 
+async def _accessory_guard(dwarf_uid, action) -> None:
+    """Runs action (a coroutine function) - after a confirmation when a
+    bulky accessory is mounted (components/end_of_night.py): the command
+    folds the Pitch (closing, or a reset to its limit)."""
+    if not end_of_night.has_accessory(dwarf_uid):
+        await action()
+        return
+    with ui.dialog() as dialog, ui.card():
+        ui.label(t("accessory_confirm"))
+        with ui.row().classes("w-full justify-end gap-2 mt-2"):
+            ui.button(t("cancel"), on_click=dialog.close).props("flat")
+
+            async def _confirmed() -> None:
+                dialog.close()
+                await action()
+
+            ui.button(t("accessory_confirm_button"), on_click=_confirmed).props("color=negative")
+    dialog.open()
+
+
+def _eq_solving(session):
+    """EQ Solving from the Actions (often run several times while the base
+    is adjusted - user practice): the axes referenced first when the Dwarf
+    doesn't give its position, so a program's calibration afterwards needs
+    no reset after the EQ (components/end_of_night.py)."""
+    end_of_night.ensure_axes_referenced(session)
+    return start_polar_align(session=session)
+
+
+def _start_astro_capture(session):
+    """Astro Capture from the Actions: the last program's run (its steps at
+    the bottom of the page) is cleared once the capture starts - it stayed
+    shown under a manual capture (user-reported Oct 2026)."""
+    result = perform_takeAstroPhoto(session=session)
+    if result is not False:
+        scheduler_runner.clear_run(session.dwarf_uid)
+    return result
+
+
 def build_actions_section(session, refresh_view) -> None:
     """Call once per page load. refresh_view: the session page's own
     session_view.refresh (see pages/session.py) - called after an action
@@ -344,11 +378,11 @@ def build_actions_section(session, refresh_view) -> None:
                 on_click=lambda: _run_and_notify(
                     session,
                     dwarf_uid,
-                    perform_takeAstroPhoto,
+                    _start_astro_capture,
                     success_message=t("astro_capture_started"),
                     refresh_view=refresh_view,
                 ),
-            ).props("flat align=left :stack=False").classes("!flex-row !justify-start text-left whitespace-nowrap truncate")
+            ).props("flat align=left :stack=False no-wrap").classes("!flex-row !justify-start text-left whitespace-nowrap truncate")
             ui.button(
                 t("stop_capture"),
                 icon="stop",
@@ -359,7 +393,7 @@ def build_actions_section(session, refresh_view) -> None:
                     success_message=t("astro_capture_stopped"),
                     refresh_view=refresh_view,
                 ),
-            ).props("flat align=left :stack=False").classes("!flex-row !justify-start text-left whitespace-nowrap truncate")
+            ).props("flat align=left :stack=False no-wrap").classes("!flex-row !justify-start text-left whitespace-nowrap truncate")
             ui.button(
                 t("stop_goto"),
                 icon="gps_off",
@@ -370,7 +404,7 @@ def build_actions_section(session, refresh_view) -> None:
                     success_message=t("goto_stopped"),
                     refresh_view=refresh_view,
                 ),
-            ).props("flat align=left :stack=False").classes("!flex-row !justify-start text-left whitespace-nowrap truncate")
+            ).props("flat align=left :stack=False no-wrap").classes("!flex-row !justify-start text-left whitespace-nowrap truncate")
             ui.button(
                 t("go_Live"),
                 icon="live_tv",
@@ -381,17 +415,17 @@ def build_actions_section(session, refresh_view) -> None:
                     success_message=t("goLive_ok"),
                     refresh_view=refresh_view,
                 ),
-            ).props("flat align=left :stack=False").classes("!flex-row !justify-start text-left whitespace-nowrap truncate")
+            ).props("flat align=left :stack=False no-wrap").classes("!flex-row !justify-start text-left whitespace-nowrap truncate")
             ui.button(
                 t("action_toggle_lights"),
                 icon="lightbulb",
                 on_click=lambda: _handle_toggle_lights(session, dwarf_uid),
-            ).props("flat align=left :stack=False").classes("!flex-row !justify-start text-left whitespace-nowrap truncate")
+            ).props("flat align=left :stack=False no-wrap").classes("!flex-row !justify-start text-left whitespace-nowrap truncate")
             ui.button(
                 t("action_toggle_power_lights"),
                 icon="battery_charging_full",
                 on_click=lambda: _handle_toggle_power_lights(session, dwarf_uid),
-            ).props("flat align=left :stack=False").classes("!flex-row !justify-start text-left whitespace-nowrap truncate")
+            ).props("flat align=left :stack=False no-wrap").classes("!flex-row !justify-start text-left whitespace-nowrap truncate")
             ui.button(
                 t("action_focus"),
                 icon="center_focus_strong",
@@ -402,7 +436,7 @@ def build_actions_section(session, refresh_view) -> None:
                     infinite=False,
                     success_message=t("action_focus_done"),
                 ),
-            ).props("flat align=left :stack=False").classes("!flex-row !justify-start text-left whitespace-nowrap truncate")
+            ).props("flat align=left :stack=False no-wrap").classes("!flex-row !justify-start text-left whitespace-nowrap truncate")
             ui.button(
                 t("action_focus_infinite"),
                 icon="all_inclusive",
@@ -413,28 +447,65 @@ def build_actions_section(session, refresh_view) -> None:
                     infinite=True,
                     success_message=t("action_focus_infinite_done"),
                 ),
-            ).props("flat align=left :stack=False").classes("!flex-row !justify-start text-left whitespace-nowrap truncate")
+            ).props("flat align=left :stack=False no-wrap").classes("!flex-row !justify-start text-left whitespace-nowrap truncate")
             ui.button(
                 t("action_polar_position"),
                 icon="explore",
-                on_click=lambda: _run_and_notify(
+                on_click=lambda: _accessory_guard(dwarf_uid, lambda: _run_and_notify(
                     session,
                     dwarf_uid,
                     _polar_position_sequence,
                     success_message=t("action_polar_position_done"),
-                ),
-            ).props("flat align=left :stack=False").classes("!flex-row !justify-start text-left whitespace-nowrap truncate")
+                )),
+            ).props("flat align=left :stack=False no-wrap").classes("!flex-row !justify-start text-left whitespace-nowrap truncate")
+            # Lenses and opening position (components/end_of_night.py)
+            ui.button(
+                t("action_close_lenses"),
+                icon="lens_blur",
+                on_click=lambda: _accessory_guard(dwarf_uid, lambda: _run_and_notify(
+                    session,
+                    dwarf_uid,
+                    end_of_night.action_close_lenses,
+                    success_message=t("action_close_lenses_done"),
+                )),
+            ).props("flat align=left :stack=False no-wrap").classes("!flex-row !justify-start text-left whitespace-nowrap truncate")
+            ui.button(
+                t("action_go_open_position"),
+                icon="settings_backup_restore",
+                on_click=lambda: _accessory_guard(dwarf_uid, lambda: _run_and_notify(
+                    session,
+                    dwarf_uid,
+                    end_of_night.action_go_to_open_position,
+                    success_message=t("action_go_open_position_done"),
+                )),
+            ).props("flat align=left :stack=False no-wrap").classes("!flex-row !justify-start text-left whitespace-nowrap truncate").tooltip(t("action_go_open_position_hint"))
+            ui.button(
+                t("action_save_open_position"),
+                icon="bookmark_add",
+                on_click=lambda: _accessory_guard(dwarf_uid, lambda: _run_and_notify(
+                    session,
+                    dwarf_uid,
+                    end_of_night.action_save_open_position,
+                    success_message="",
+                    failure_message=t("action_save_open_position_failed"),
+                    display_duration=8.0,
+                    success_message_fn=lambda: t(
+                        "action_save_open_position_done",
+                        position=end_of_night.describe_position(end_of_night.open_position(dwarf_uid)),
+                    ),
+                )),
+            ).props("flat align=left :stack=False no-wrap").classes("!flex-row !justify-start text-left whitespace-nowrap truncate").tooltip(t("action_save_open_position_hint"))
             ui.button(
                 t("action_eq_solving"),
                 icon="my_location",
                 on_click=lambda: _run_and_notify(
                     session,
                     dwarf_uid,
-                    start_polar_align,
+                    _eq_solving,
                     success_message=t("action_eq_solving_done"),
                     refresh_view=eq_result_update,
                 ),
-            ).props("flat align=left :stack=False").classes("!flex-row !justify-start text-left whitespace-nowrap truncate")
+            ).props("flat align=left :stack=False no-wrap").classes("!flex-row !justify-start text-left whitespace-nowrap truncate")
             ui.button(
                 t("action_calibrate"),
                 icon="tune",
@@ -444,11 +515,11 @@ def build_actions_section(session, refresh_view) -> None:
                     perform_calibration,
                     success_message=t("action_calibrate_done"),
                 ),
-            ).props("flat align=left :stack=False").classes("!flex-row !justify-start text-left whitespace-nowrap truncate")
+            ).props("flat align=left :stack=False no-wrap").classes("!flex-row !justify-start text-left whitespace-nowrap truncate")
             ui.button(
                 t("action_reboot"),
                 icon="restart_alt",
                 on_click=lambda: _handle_reboot(session, dwarf_uid),
-            ).props("flat align=left color=negative").classes("!flex-row !justify-start text-left whitespace-nowrap truncate")
+            ).props("flat align=left color=negative no-wrap").classes("!flex-row !justify-start text-left whitespace-nowrap truncate")
 
             eq_result_update = _build_eq_result_panel(session)

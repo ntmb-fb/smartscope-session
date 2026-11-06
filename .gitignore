@@ -3,6 +3,7 @@
 /dwarf_python_api*
 *.log
 *.log.old
+*.log.old.*
 *.pyc
 *.tmp
 /build
@@ -12,7 +13,14 @@ config.lock
 /Astro_Sessions
 /Devices_Sessions
 *.pyd
-/old_test
 /doc
 /.vscode
 /__pycache__
+/assets/catalog_add_on.json
+version.py
+/end_of_night.json
+/eclipsing_binaries.json
+/.nicegui
+/dist
+/sync_backups
+/AstroDwarfUI-unknown

@@ -11,22 +11,26 @@ The Scripts tab also carries the per-device scheduler arm/disarm switch
 it's exactly the queue that switch controls."""
 from __future__ import annotations
 
-import json
 import os
 import uuid
 from datetime import datetime
 
-from nicegui import ui
+from nicegui import run, ui
 
 from dwarf_python_api.lib.dwarf_session import get_manager
 
-from components import scheduler_loop, scheduler_runner
+from components import eclipsing_binaries, scheduler_loop, scheduler_runner, scope_archive, task_check_cache
 from components.i18n import get_language, t
+from components.json_files import read_json, write_json_atomic
+from components.end_of_night_card import build_end_of_night_card
 from components.program_editor import build_program_editor
+from components.site_time import site_now
 from components.schedule_editor import build_schedule_editor
 from components.session_dirs import session_dirs_for
+from components.task_check import open_task_check, program_task
 from components.pwa import add_pwa_head_tags
 from components.theme import apply_theme
+from device_registry import name_and_uid
 
 
 def _list_json_files(directory: str) -> list[str]:
@@ -36,11 +40,19 @@ def _list_json_files(directory: str) -> list[str]:
 
 
 def _read_json(filepath: str) -> dict | None:
-    try:
-        with open(filepath, encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return None
+    data, _reason = read_json(filepath)
+    return data
+
+
+def _notify_unreadable(filepath: str) -> None:
+    """Why a program file couldn't be read (user-reported Oct 2026: a
+    plain "Invalid JSON file" with no detail, also when the file had just
+    left ToDo)."""
+    _data, reason = read_json(filepath)
+    if reason == "missing":
+        ui.notify(t("program_file_missing", name=os.path.basename(filepath)), type="warning")
+    else:
+        ui.notify(t("program_invalid_json", error=f"{os.path.basename(filepath)}: {reason}"), type="negative")
 
 
 def _parse_datetime(date_str: str | None, time_str: str | None) -> datetime | None:
@@ -83,7 +95,7 @@ def build_programs_page() -> None:
         with ui.column().classes(
             "w-full max-w-md md:max-w-lg lg:max-w-xl xl:max-w-2xl 2xl:max-w-[900px] mx-auto gap-3 p-4"
         ):
-            with ui.row().classes("items-center gap-2"):
+            with ui.row().classes("w-full items-center gap-2"):
                 ui.button(
                     icon="arrow_back",
                     on_click=lambda: ui.navigate.to(f"/session/{dwarf_uid}"),
@@ -117,13 +129,41 @@ def build_programs_page() -> None:
                 ).props("flat round").tooltip(t("program_page_link"))
                 # smartscopes hook: TonightPlan import (fork addition)
                 import smartscopes; smartscopes.dwarf_tonightplan_button(session, lambda: render_scripts())
+                ui.space()
+                # Variable stars, optional (user-requested Oct 2026): turns
+                # on the editor's "Eclipsing binary minimum" button and
+                # loads the stars' elements - kept for this run of the app
+                # (components/eclipsing_binaries.py's feature).
+                variable_button = ui.button(icon="contrast").props("flat round")
+                with variable_button:
+                    variable_tip = ui.tooltip("")
+
+                def _show_variable_state() -> None:
+                    on = eclipsing_binaries.feature.enabled
+                    variable_button.props(f"color={'primary' if on else 'grey'}")
+                    variable_tip.set_text(t("eb_feature_on" if on else "eb_feature_off"))
+
+                async def _toggle_variable_stars() -> None:
+                    feature = eclipsing_binaries.feature
+                    feature.enabled = not feature.enabled
+                    _show_variable_state()
+                    if not feature.enabled:
+                        ui.notify(t("eb_feature_disabled"))
+                        return
+                    ui.notify(t("eb_feature_enabled"))
+                    failed = await run.io_bound(eclipsing_binaries.fetch_elements)
+                    if failed:
+                        ui.notify(t("eb_fetch_failed", names=", ".join(failed)), type="warning", multi_line=True)
+
+                variable_button.on_click(_toggle_variable_stars)
+                _show_variable_state()
             # In native mode (ui.run(native=True)) there is no address
             # bar at all - the URL's dwarf_uid, which is the ONLY thing
             # that determines which device Scripts/Results/relaunch
             # apply to, would otherwise be completely invisible to the
             # user. Shown explicitly here so it's never a guess.
             ui.label(t("programs_title")).classes("text-xl")
-            ui.label(session.dwarf_uid).classes("text-sm text-grey-6 -mt-2")
+            ui.label(name_and_uid(session)).classes("text-sm text-grey-6 -mt-2")
 
             with ui.tabs().classes("w-full") as tabs:
                 editor_tab = ui.tab(t("tab_editor"))
@@ -191,13 +231,14 @@ def build_programs_page() -> None:
                             ),
                         )
                     ui.label(t("scheduler_armed_hint")).classes("text-xs text-grey-6")
+                    build_end_of_night_card(session)
 
                     scripts_container = ui.column().classes("w-full gap-2 mt-2")
 
                     def load_for_edit(filepath: str) -> None:
                         data = _read_json(filepath)
                         if data is None:
-                            ui.notify(t("program_invalid_json", error=""), type="negative")
+                            _notify_unreadable(filepath)
                             return
                         tabs.set_value(editor_tab)
                         render_editor(initial=data)
@@ -205,7 +246,7 @@ def build_programs_page() -> None:
                     def relaunch(filepath: str) -> None:
                         data = _read_json(filepath)
                         if data is None:
-                            ui.notify(t("program_invalid_json", error=""), type="negative")
+                            _notify_unreadable(filepath)
                             return
                         try:
                             scheduler_runner.start_run(
@@ -278,7 +319,7 @@ def build_programs_page() -> None:
                         entry is left untouched as history."""
                         data = _read_json(filepath)
                         if data is None:
-                            ui.notify(t("program_invalid_json", error=""), type="negative")
+                            _notify_unreadable(filepath)
                             return
                         tabs.set_value(editor_tab)
                         render_editor(initial=data)
@@ -305,12 +346,12 @@ def build_programs_page() -> None:
                         confusion with the original file's own identity."""
                         data = _read_json(filepath)
                         if data is None:
-                            ui.notify(t("program_invalid_json", error=""), type="negative")
+                            _notify_unreadable(filepath)
                             return
 
                         cmd = data.get("command", {})
                         id_command = cmd.setdefault("id_command", {})
-                        now = datetime.now()
+                        now = site_now(session.config)
                         id_command["uuid"] = f"{uuid.uuid4()}-00001"
                         id_command["date"] = now.strftime("%Y-%m-%d")
                         id_command["time"] = now.strftime("%H:%M:%S")
@@ -319,13 +360,82 @@ def build_programs_page() -> None:
                         os.makedirs(dirs["TODO_DIR"], exist_ok=True)
                         new_filename = f"{id_command['date']}-{id_command['time'].replace(':', '-')}-relaunch.json"
                         new_filepath = os.path.join(dirs["TODO_DIR"], new_filename)
-                        with open(new_filepath, "w", encoding="utf-8") as f:
-                            json.dump({"command": cmd}, f, indent=4)
+                        write_json_atomic(new_filepath, {"command": cmd})
 
                         try:
                             scheduler_runner.start_run(
                                 dwarf_uid, cmd, session, source_filepath=new_filepath
                             )
+                        except RuntimeError as exc:
+                            ui.notify(str(exc), type="warning")
+                            return
+                        ui.notify(t("program_running"), type="positive")
+                        ui.navigate.to(f"/session/{dwarf_uid}")
+
+                    async def force_resume(filepath: str) -> None:
+                        """Error/ program whose capture the Dwarf is still
+                        running: back to Current/ and resumed (see
+                        scheduler_runner.force_resume_from_error())."""
+                        ok = await run.io_bound(
+                            scheduler_runner.force_resume_from_error, dwarf_uid, session, filepath
+                        )
+                        ui.notify(
+                            t("results_force_resume_done") if ok else t("results_force_resume_failed"),
+                            type="positive" if ok else "warning",
+                        )
+                        render_results()
+
+                    def repair_session(filepath: str) -> None:
+                        """A failed capture whose images are on the Dwarf but
+                        not in its Album (user-asked Oct 2026, from DwarfLab's
+                        procedure - "How I Fixed My Failed Session"): the same
+                        program again with 2 images, a session entry in the
+                        Album that Scope Archive then fills with the failed
+                        one's images (Repair). Asked first: it moves the Dwarf."""
+                        data = _read_json(filepath)
+                        if data is None:
+                            _notify_unreadable(filepath)
+                            return
+                        with ui.dialog() as dialog, ui.card().classes("max-w-lg"):
+                            ui.label(t("results_repair_title")).classes("text-base font-medium")
+                            ui.label(t("results_repair_text")).classes("text-sm whitespace-pre-line")
+                            with ui.row().classes("w-full justify-end gap-2 mt-2"):
+                                ui.button(t("cancel"), on_click=dialog.close).props("flat")
+
+                                def _go() -> None:
+                                    dialog.close()
+                                    _start_repair_session(data)
+
+                                ui.button(t("results_repair_start"), icon="build", on_click=_go).props("color=primary")
+                        dialog.open()
+
+                    def _start_repair_session(data: dict) -> None:
+                        cmd = data.get("command", {})
+                        id_command = cmd.setdefault("id_command", {})
+                        failed = id_command.get("starting_date") or f"{id_command.get('date', '')} {id_command.get('time', '')}"
+                        for key in ("process", "result", "message", "nb_try", "starting_date", "processed_date",
+                                    "last_step", "last_step_time", "shots_taken", "shots_stacked", "battery_end"):
+                            id_command.pop(key, None)
+                        now = site_now(session.config)
+                        id_command["uuid"] = f"{uuid.uuid4()}-00001"
+                        id_command["date"] = now.strftime("%Y-%m-%d")
+                        id_command["time"] = now.strftime("%H:%M:%S")
+                        id_command["description"] = f"Repair session for the capture of {failed.strip()} - " + (
+                            id_command.get("description") or "")
+                        id_command["repair_of"] = failed.strip()
+                        # The same target, exposure, gain and filter - 2 images
+                        camera = cmd.get("setup_camera") or {}
+                        camera.update(count="2", end_time="", doMosaic=False)
+                        cmd["setup_camera"] = camera
+                        cmd.setdefault("setup_wide_camera", {})["do_action"] = False
+
+                        dirs = session_dirs_for(session)
+                        os.makedirs(dirs["TODO_DIR"], exist_ok=True)
+                        new_filename = f"{id_command['date']}-{id_command['time'].replace(':', '-')}-repair.json"
+                        new_filepath = os.path.join(dirs["TODO_DIR"], new_filename)
+                        write_json_atomic(new_filepath, {"command": cmd})
+                        try:
+                            scheduler_runner.start_run(dwarf_uid, cmd, session, source_filepath=new_filepath)
                         except RuntimeError as exc:
                             ui.notify(str(exc), type="warning")
                             return
@@ -405,10 +515,34 @@ def build_programs_page() -> None:
                                                 f" \u00b7 {t('prog_mosaic')}"
                                             )
                                         ui.label(detail).classes("text-xs")
+                                    if id_command.get("total_exposure_s"):
+                                        # A megastack: its total exposure, from
+                                        # its FITS (components/megastack.py)
+                                        from pages.explorer import _format_duration
+                                        detail = (
+                                            f"{t('prog_total_exposure')}: "
+                                            f"{_format_duration(id_command['total_exposure_s'])}"
+                                        )
+                                        if not id_command.get("exposure_actual") and id_command.get("shots_taken"):
+                                            detail += (
+                                                f" \u00b7 {id_command.get('shots_stacked', 0)}/"
+                                                f"{id_command['shots_taken']} {t('prog_shots_stacked')}"
+                                            )
+                                        ui.label(detail).classes("text-xs")
+                                    check_task = program_task(program, session.config)
+                                    if not id_command.get("shots_taken") and check_task is not None:
+                                        # Counts found by an earlier View / Check
+                                        shots = task_check_cache.shots_text(
+                                            task_check_cache.get(dwarf_uid, check_task), t("prog_shots_stacked")
+                                        )
+                                        if shots:
+                                            ui.label(shots).classes("text-xs")
                                     if id_command.get("starting_date") or id_command.get("processed_date"):
+                                        # "Error" date for a failed run
+                                        end_label = t("results_failed_at") if kind == "error" else t("results_finished")
                                         ui.label(
                                             f"{t('results_started')}: {id_command.get('starting_date', '\u2013')}"
-                                            f"  \u2192  {t('results_finished')}: {id_command.get('processed_date', '\u2013')}"
+                                            f"  \u2192  {end_label}: {id_command.get('processed_date', '\u2013')}"
                                         ).classes("text-xs text-grey-5")
                                     with ui.row().classes("gap-1 mt-1"):
                                         ui.button(
@@ -419,6 +553,51 @@ def build_programs_page() -> None:
                                             icon="replay",
                                             on_click=lambda p=filepath: relaunch_result(p),
                                         ).props("flat dense round color=primary")
+                                        # What the Dwarf saved for this run: "View" (done,
+                                        # blue) / "Check" (error, red), see task_check.py
+                                        if check_task is not None:
+                                            ui.button(
+                                                t("task_view") if kind == "done" else t("task_check"),
+                                                icon="image" if kind == "done" else "fact_check",
+                                                on_click=lambda _, task=check_task: open_task_check(
+                                                    session, task, on_result=render_results
+                                                ),
+                                            ).props(
+                                                f"flat dense no-caps size=sm color={'primary' if kind == 'done' else 'negative'}"
+                                            )
+                                        # A finished Repair session: the rest in
+                                        # Scope Archive, both captures filled in
+                                        repair_link = scope_archive.repair_url(session.config, program) \
+                                            if kind == "done" else None
+                                        if repair_link:
+                                            ui.button(
+                                                t("results_repair_finish"), icon="build",
+                                                on_click=lambda u=repair_link: scope_archive.open_page(u),
+                                            ).props("flat dense no-caps size=sm color=primary").tooltip(
+                                                t("results_repair_finish_hint")
+                                            )
+                                        # A failed capture (no stacked image in the
+                                        # Dwarf's Album): a 2-image session to
+                                        # repair it with Scope Archive
+                                        if (kind == "error" and program.get("setup_camera", {}).get("do_action")
+                                                and not program.get("setup_camera", {}).get("doMosaic")
+                                                and id_command.get("starting_date")):
+                                            ui.button(
+                                                t("results_repair"), icon="build",
+                                                on_click=lambda p=filepath: repair_session(p),
+                                            ).props("flat dense no-caps size=sm").tooltip(t("results_repair_hint"))
+                                        # The Dwarf is still capturing this
+                                        # program's target (error < 15 h)
+                                        if kind == "error" and scheduler_runner.can_force_resume(
+                                            dwarf_uid, session, program
+                                        ):
+                                            ui.button(
+                                                t("results_force_resume"),
+                                                icon="play_circle",
+                                                on_click=lambda p=filepath: force_resume(p),
+                                            ).props("flat dense no-caps color=positive").tooltip(
+                                                t("results_force_resume_hint")
+                                            )
 
                     render_results()
 

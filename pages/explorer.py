@@ -19,14 +19,23 @@ themselves, only the JSON listing call."""
 from __future__ import annotations
 
 import asyncio
+import inspect
 from datetime import datetime
+from pathlib import Path
+
+import re
+from urllib.parse import quote
 
 import requests
-from nicegui import run, ui
+from fastapi import HTTPException
+from fastapi.responses import Response
+from nicegui import app, background_tasks, run, ui
 
 from dwarf_python_api.lib.dwarf_session import get_manager
 from dwarf_python_api.lib.dwarf_utils import perform_list_astro_sessions_http
+import dwarf_python_api.lib.my_logger as log
 
+from components import dwarf_media, scope_archive
 from components.i18n import t
 from components.pwa import add_pwa_head_tags
 from components.theme import apply_theme
@@ -65,6 +74,9 @@ def _fetch_shots_info(url: str) -> dict | None:
 
 
 def _format_duration(total_seconds: float) -> str:
+    # Under a second (the Sun's few ms, user-seen "0s"): its own value
+    if 0 < total_seconds < 1:
+        return f"{total_seconds:.3g}s"
     total_seconds = int(total_seconds)
     hours, remainder = divmod(total_seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
@@ -101,6 +113,12 @@ def _get_details(entry: dict) -> dict | None:
     return None
 
 
+def _megastack_eligible(entry: dict) -> bool:
+    """Can be megastacked: a single capture or a mosaic (their FITS in the
+    panels' subfolders), not an earlier megastack."""
+    return bool(entry.get("astroImageDetails") or entry.get("astroMosaicImageDetails"))
+
+
 def _target_name(entry: dict) -> str:
     details = _get_details(entry)
     if details and details.get("target"):
@@ -117,7 +135,87 @@ def _format_datetime(unix_ts) -> str:
         return ""
 
 
+def _download_name(path: str) -> str:
+    """File name to save under: the Dwarf's own name when it says what
+    the session is ("stacked-16_M 42 ..._60s40_Duo-Band_...png"), else
+    the session folder before it (stacked.jpg says nothing on its own)."""
+    parts = path.strip("/").split("/")
+    base = parts[-1]
+    stem = base.rsplit(".", 1)[0]
+    name = base if stem.lower() not in ("stacked", "stacked_thumbnail") and len(parts) >= 1 else "_".join(parts[-2:])
+    return re.sub(r'[\\/:*?"<>|]', "_", name)
+
+
+def _content_disposition(name: str) -> str:
+    # HTTP headers are latin-1: ASCII fallback + the UTF-8 name (RFC 6266)
+    ascii_name = name.encode("ascii", "replace").decode("ascii").replace("?", "_")
+    return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(name)}"
+
+
+def _write_file(target: Path, data: bytes) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(data)
+
+
+async def _in_app_window(client) -> bool:
+    """The click comes from this app's own window on the PC (pywebview),
+    not from a browser - a phone included (user-reported Nov 2026: with the
+    app in its window on the PC, a download asked from a phone opened the
+    Save dialog on the PC and saved the image there, nothing on the phone)."""
+    if getattr(app.native, "main_window", None) is None:
+        return False
+    try:
+        return bool(await client.run_javascript("!!window.pywebview", timeout=2.0))
+    except Exception:
+        return False
+
+
+async def _save_path(name: str) -> Path | None:
+    """Where to save in the native window (pywebview): the user's own
+    Save dialog, else the Downloads folder (user-reported Oct 2026: the
+    browser download does nothing there, unlike in a real browser).
+    NiceGUI's window proxy is async: its create_file_dialog() is awaited
+    (user-reported Oct 2026: called in a thread, it returned a coroutine
+    and the save failed)."""
+    window = getattr(app.native, "main_window", None)
+    if window is not None:
+        try:
+            import webview  # only present with the native window
+            chosen = window.create_file_dialog(webview.FileDialog.SAVE, save_filename=name)
+            if inspect.isawaitable(chosen):
+                chosen = await chosen
+        except Exception as e:  # any pywebview/platform failure: the fallback below
+            log.debug(f"Native save dialog unavailable ({e})")
+        else:
+            if not chosen:
+                return None  # cancelled
+            return Path(chosen[0] if isinstance(chosen, (list, tuple)) else chosen)
+    return Path.home() / "Downloads" / name
+
+
 def build_explorer_page() -> None:
+    # Image download (user-requested Oct 2026): fetched from the Dwarf by
+    # this backend and sent back as an attachment - the browser's own
+    # download attribute is ignored for another origin (the Dwarf), it
+    # would just open the image.
+    @app.get("/session/{dwarf_uid}/explorer/download")
+    async def explorer_download(dwarf_uid: str, path: str) -> Response:
+        try:
+            session = get_manager().get(dwarf_uid)
+        except KeyError:
+            raise HTTPException(status_code=404)
+        # Only the Dwarf's own media files
+        if not path.startswith("/") or ".." in path or not session.config.dwarf_ip:
+            raise HTTPException(status_code=400)
+        data = await run.io_bound(dwarf_media.fetch, session.config.dwarf_ip, path)
+        if data is None:
+            raise HTTPException(status_code=502)
+        return Response(
+            data,
+            media_type="image/png" if path.lower().endswith(".png") else "image/jpeg",
+            headers={"Content-Disposition": _content_disposition(_download_name(path))},
+        )
+
     @ui.page("/session/{dwarf_uid}/explorer")
     def explorer_page(dwarf_uid: str) -> None:
         add_pwa_head_tags()
@@ -141,11 +239,148 @@ def build_explorer_page() -> None:
                     "flat round"
                 )
                 ui.label(t("explorer_title")).classes("text-xl")
-                ui.element("div").classes("w-8")  # keeps the title centered
+                # Megastack (components/megastack.py): tick sessions of a target,
+                # the Dwarf stacks them together
+                megastack_toggle = ui.button(icon="auto_awesome_motion").props("flat round").tooltip(
+                    t("explorer_megastack")
+                )
 
             if session is None or not session.config.dwarf_ip:
                 ui.label(t("explorer_no_ip")).classes("text-grey-6")
                 return
+
+            # Megastack selection: the sessions ticked, by thumbnail path
+            selecting = [False]
+            selected: dict[str, dict] = {}
+            tiles: dict[str, ui.column] = {}
+            tile_entries: dict[str, dict] = {}
+            # Selection mode: a header per target above its sessions
+            target_headers: dict[str, ui.label] = {}
+            with ui.row().classes("w-full items-center gap-2 no-wrap") as megastack_bar:
+                megastack_label = ui.label("").classes("text-sm flex-1 min-w-0")
+                megastack_start = ui.button(t("explorer_megastack_start"), icon="auto_awesome_motion") \
+                    .props("dense no-caps color=primary")
+            megastack_bar.set_visibility(False)
+
+            def _refresh_megastack_bar() -> None:
+                if not selected:
+                    megastack_label.set_text(t("explorer_megastack_hint"))
+                else:
+                    target = _target_name(next(iter(selected.values())))
+                    megastack_label.set_text(t("explorer_megastack_selected", count=len(selected), target=target))
+                # One session too: the Dwarf restacks it (user-reported)
+                megastack_start.set_enabled(len(selected) >= 1)
+
+            def _toggle_selecting() -> None:
+                selecting[0] = not selecting[0]
+                megastack_toggle.props(f"color={'primary' if selecting[0] else ''}")
+                if not selecting[0]:
+                    for path in list(selected):
+                        tiles[path].classes(remove="ring-4 ring-primary")
+                    selected.clear()
+                megastack_bar.set_visibility(selecting[0])
+                _refresh_megastack_bar()
+                _arrange_tiles()
+
+            def _arrange_tiles() -> None:
+                """Selection mode (user-requested Oct 2026): only the sessions
+                that can be megastacked, grouped by target (A-Z, newest first
+                in each) under a header - by the tiles' CSS order, the grid
+                isn't rebuilt. Else every session, newest first."""
+                if not selecting[0]:
+                    for tile in tiles.values():
+                        tile.style("order: 0")
+                        tile.set_visibility(True)
+                    for header in target_headers.values():
+                        header.set_visibility(False)
+                    return
+                eligible = sorted(
+                    (e for e in tile_entries.values() if _megastack_eligible(e)),
+                    key=lambda e: (_target_name(e).casefold(), -(e.get("modificationTime") or 0)),
+                )
+                counts: dict[str, int] = {}
+                for entry in eligible:
+                    counts[_target_name(entry)] = counts.get(_target_name(entry), 0) + 1
+                order = 0
+                shown: set[str] = set()
+                for entry in eligible:
+                    target = _target_name(entry)
+                    if target not in shown:
+                        shown.add(target)
+                        header = target_headers.get(target)
+                        if header is None:
+                            with grid:
+                                header = ui.label("").classes("col-span-full text-sm font-medium mt-2")
+                            target_headers[target] = header
+                        header.set_text(f"{target} ({counts[target]})")
+                        header.style(f"order: {order}")
+                        header.set_visibility(True)
+                        order += 1
+                    tiles[entry["thumbnailPath"]].style(f"order: {order}")
+                    order += 1
+                eligible_paths = {e["thumbnailPath"] for e in eligible}
+                for path, tile in tiles.items():
+                    tile.set_visibility(path in eligible_paths)
+                for target, header in target_headers.items():
+                    if target not in shown:
+                        header.set_visibility(False)
+
+            megastack_toggle.on_click(_toggle_selecting)
+
+            def _toggle_entry(entry: dict) -> None:
+                path = entry.get("thumbnailPath") or ""
+                if path in selected:
+                    del selected[path]
+                    tiles[path].classes(remove="ring-4 ring-primary")
+                else:
+                    # Single captures, or mosaics (user-requested Oct 2026: their
+                    # FITS in the panels' subfolders) - not mixed, not an
+                    # earlier megastack
+                    if not _megastack_eligible(entry):
+                        ui.notify(t("explorer_megastack_not_eligible"), type="warning")
+                        return
+                    first = next(iter(selected.values()), None)
+                    if first and _target_name(entry) != _target_name(first):
+                        ui.notify(t("explorer_megastack_other_target"), type="warning")
+                        return
+                    if first and bool(entry.get("astroMosaicImageDetails")) != bool(first.get("astroMosaicImageDetails")):
+                        ui.notify(t("explorer_megastack_mixed"), type="warning")
+                        return
+                    selected[path] = entry
+                    tiles[path].classes(add="ring-4 ring-primary")
+                _refresh_megastack_bar()
+
+            def _on_tile(entry: dict):
+                if selecting[0]:
+                    _toggle_entry(entry)
+                    return None
+                return open_dialog(entry)  # awaited by the click handler
+
+            def _confirm_megastack() -> None:
+                from components import megastack
+
+                entries = list(selected.values())
+                target = _target_name(entries[0])
+                folders = [megastack._session_folder(e) for e in entries]
+                with ui.dialog() as confirm, ui.card().classes("w-[min(90vw,480px)]"):
+                    ui.label(t("explorer_megastack_title", target=target)).classes("text-base font-medium")
+                    ui.label(t("explorer_megastack_confirm", count=len(folders))).classes("text-sm") \
+                        .style("white-space: pre-line")
+                    with ui.row().classes("w-full justify-end gap-2"):
+                        ui.button(t("cancel"), on_click=confirm.close).props("flat")
+
+                        def go() -> None:
+                            confirm.close()
+                            error = megastack.start(session, folders, target)
+                            if error:
+                                ui.notify(t("explorer_megastack_failed", error=error), type="negative", multi_line=True)
+                                return
+                            ui.navigate.to(f"/session/{dwarf_uid}")
+
+                        ui.button(t("explorer_megastack_start"), icon="auto_awesome_motion", on_click=go)
+                confirm.open()
+
+            megastack_start.on_click(_confirm_megastack)
 
             grid = ui.grid().classes("grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3 w-full")
             spinner = ui.spinner(size="lg").classes("mx-auto")
@@ -165,7 +400,23 @@ def build_explorer_page() -> None:
                 with ui.column().classes("w-full gap-1 p-3"):
                     with ui.row().classes("w-full justify-between items-center"):
                         dialog_target_label = ui.label("").classes("text-base font-medium")
-                        ui.button(icon="close", on_click=dialog.close).props("flat round dense")
+                        with ui.row().classes("gap-1 items-center"):
+                            # Archive with Dwarfium Scope Archive: its import page then its
+                            # Transfer page, in its own window when it has one (scope_archive.py)
+                            archive_link = ui.button(
+                                icon="inventory_2",
+                                on_click=lambda: scope_archive.archive_session(session.config, current_path[0]),
+                            ).props("flat round dense").tooltip(t("archive_in_scope_archive"))
+                            scope_archive.watch_presence(
+                                archive_link, lambda: scope_archive.transfer_url(session.config, current_path[0])
+                            )
+                            with ui.button(icon="download").props("flat round dense").tooltip(
+                                t("explorer_download")
+                            ):
+                                with ui.menu() as download_menu:
+                                    ui.menu_item("JPG", on_click=lambda: _download_current("jpg"))
+                                    png_item = ui.menu_item("PNG", on_click=lambda: _download_current("png"))
+                            ui.button(icon="close", on_click=dialog.close).props("flat round dense")
                     # Date/Exposure/Gain (user-requested Sep 2026: "Date,
                     # Cible et details de prise de vue") - all read
                     # directly from the SAME listing entry already in
@@ -196,7 +447,69 @@ def build_explorer_page() -> None:
                     _shots_info_cache[thumb_path] = await run.io_bound(_fetch_shots_info, url)
                 return _shots_info_cache[thumb_path]
 
+            _total_exposure_cache: dict[str, float | None] = {}
+
+            async def _ensure_total_exposure(thumb_path: str) -> float | None:
+                """A megastack result's total exposure (components/
+                megastack.py: its FITS headers), read once per session."""
+                from components import megastack
+
+                if thumb_path not in _total_exposure_cache:
+                    _total_exposure_cache[thumb_path] = await run.io_bound(
+                        megastack.total_exposure_s, session.config.dwarf_ip, thumb_path.rsplit("/", 1)[0]
+                    )
+                return _total_exposure_cache[thumb_path]
+
+            current_path: list[str] = [""]
+            current_png: list[str | None] = [None]
+
+            async def _download_current(kind: str) -> None:
+                """JPG (the album's own stacked.jpg) or the session's PNG.
+                Asked from the app's window, the file is written on the PC
+                and its path shown; from a browser (a phone too), it is the
+                browser's download."""
+                download_menu.close()
+                path = current_png[0] if kind == "png" else current_path[0]
+                if not path:
+                    return
+                name = _download_name(path)
+                if not await _in_app_window(ui.context.client):
+                    ui.download.from_url(
+                        f"/session/{dwarf_uid}/explorer/download?path={quote(path)}", filename=name
+                    )
+                    return
+                target = await _save_path(name)
+                if target is None:
+                    return  # cancelled
+                notification = ui.notification(t("explorer_downloading"), spinner=True, timeout=None)
+                try:
+                    data = await run.io_bound(dwarf_media.fetch, session.config.dwarf_ip, path)
+                    if data is None:
+                        notification.dismiss()
+                        ui.notify(t("explorer_download_failed"), type="negative")
+                        return
+                    await run.io_bound(_write_file, target, data)
+                except OSError as e:
+                    notification.dismiss()
+                    ui.notify(f"{t('explorer_download_failed')} ({e})", type="negative")
+                    return
+                notification.dismiss()
+                ui.notify(t("explorer_downloaded", path=str(target)), type="positive", timeout=8000)
+
+            async def _look_for_png(path: str) -> None:
+                """The session's PNG, looked for over FTP when the large
+                view opens (the album listing only gives the JPG)."""
+                current_png[0] = None
+                png_item.set_visibility(False)
+                found = await run.io_bound(dwarf_media.png_path, session.config.dwarf_ip, path)
+                if found and current_path[0] == path:
+                    current_png[0] = found
+                    png_item.set_visibility(True)
+
             async def open_dialog(entry: dict) -> None:
+                current_path[0] = entry["filePath"]
+                archive_link.set_visibility(scope_archive.transfer_url(session.config, entry["filePath"]) is not None)
+                background_tasks.create(_look_for_png(entry["filePath"]))
                 url = _thumbnail_url(session.config.dwarf_ip, entry["filePath"])
                 full_image.set_source(url)
                 dialog_target_label.set_text(_target_name(entry))
@@ -223,6 +536,17 @@ def build_explorer_page() -> None:
                     info = await _ensure_shots_info(thumb_path)
                     if info:
                         dialog_shots_label.set_text(_shots_info_caption(info))
+                    # A megastack's result: its total exposure, from its FITS
+                    # (no exposure in its listing nor its shotsInfo.json)
+                    if entry.get("astroMultiImageDetails"):
+                        exposure = await _ensure_total_exposure(thumb_path)
+                        if exposure:
+                            caption = dialog_shots_label.text
+                            bits = [caption] if caption else []
+                            if not caption and info and info.get("shotsStacked") is not None:
+                                bits.append(f"{info['shotsStacked']} {t('prog_shots_stacked')}")
+                            bits.append(f"{t('prog_total_exposure')}: {_format_duration(exposure)}")
+                            dialog_shots_label.set_text(" \u00b7 ".join(bits))
 
             async def load() -> None:
                 sessions = await run.io_bound(perform_list_astro_sessions_http, session=session)
@@ -243,8 +567,10 @@ def build_explorer_page() -> None:
                         if not thumb_path:
                             continue
                         with ui.column().classes(
-                            "gap-1 cursor-pointer"
-                        ).on("click", lambda e=entry: open_dialog(e)):
+                            "gap-1 cursor-pointer rounded"
+                        ).on("click", lambda e=entry: _on_tile(e)) as tile:
+                            tiles[thumb_path] = tile
+                            tile_entries[thumb_path] = entry
                             ui.image(_thumbnail_url(session.config.dwarf_ip, thumb_path)).classes(
                                 "w-full aspect-square rounded"
                             ).props("fit=cover")
@@ -258,10 +584,18 @@ def build_explorer_page() -> None:
                             # sessions to warm _shots_info_cache for
                             # below (so the dialog opens with the data
                             # already there, no extra wait on click).
+                            # Its target above the date (user-requested Oct
+                            # 2026: not seen in the gallery)
+                            ui.label(_target_name(entry)).classes(
+                                "text-xs text-center font-medium truncate w-full"
+                            )
                             ui.label(_format_datetime(entry.get("modificationTime"))).classes(
                                 "text-xs text-center text-grey-6 truncate w-full"
                             )
                             thumb_paths_to_prefetch.add(thumb_path)
+
+                # Selection mode turned on while the album loaded
+                _arrange_tiles()
 
                 # Fetches shotsInfo.json for every thumbnail above,
                 # bounded concurrency - a real capture can list 175+

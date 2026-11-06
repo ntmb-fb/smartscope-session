@@ -2,6 +2,8 @@ import json
 import time
 from datetime import datetime, timedelta
 
+from components.site_time import session_now
+
 from dwarf_python_api.lib.dwarf_utils import perform_GoLive
 from dwarf_python_api.lib.dwarf_utils import perform_enter_astro_mode
 from dwarf_python_api.lib.dwarf_utils import perform_enter_shooting_mode
@@ -13,8 +15,7 @@ from dwarf_python_api.lib.dwarf_utils import perform_calibration
 from dwarf_python_api.lib.dwarf_utils import perform_goto
 from dwarf_python_api.lib.dwarf_utils import perform_stop_goto
 from dwarf_python_api.lib.dwarf_utils import perform_goto_stellar
-from dwarf_python_api.lib.dwarf_utils import parse_ra_to_float
-from dwarf_python_api.lib.dwarf_utils import parse_dec_to_float
+from components.coords import parse_dec_degrees, parse_ra_hours
 from dwarf_python_api.lib.dwarf_utils import perform_takeAstroPhoto
 from dwarf_python_api.lib.dwarf_utils import perform_continue_shooting
 from dwarf_python_api.lib.dwarf_utils import perform_clear_needs_continue_shooting
@@ -98,6 +99,7 @@ STEP_DESCRIPTIONS = {
     "step_1c": "Do Automatic Autofocus",
     "step_1d": "Do Infinite Autofocus",
     "step_1e": "Entering Astro/DSO (or Solar) shooting mode",
+    "step_1f": "Move to the start position",
     "step_2": "Set Exposure to 1s for Calibration",
     "step_3": "Set Gain to 80 for Calibration",
     "step_4": "Set IR Filter for Calibration",
@@ -115,7 +117,7 @@ STEP_DESCRIPTIONS = {
     "step_16": "Stop Tele and Wide Astro photo Session",
 }
 
-def _parse_end_time(value):
+def _parse_end_time(value, session=None):
     """'HH:MM' (24h, program_editor.py's prog_end_time field) -> a
     datetime for the NEXT occurrence of that clock time, or None if
     blank/unset/unparseable.
@@ -127,13 +129,17 @@ def _parse_end_time(value):
     instead. Without this, the very first check in
     _wait_for_astro_end() below would see an already-past deadline and
     stop the capture almost immediately, instead of after actually
-    crossing midnight."""
+    crossing midnight.
+
+    Site time (components/site_time.py): end_time is wall-clock time at
+    the Dwarf's site, like the program's own start date/time."""
     if not value:
         return None
     try:
         hour, minute = str(value).strip().split(":")
-        candidate = datetime.now().replace(hour=int(hour), minute=int(minute), second=0, microsecond=0)
-        if candidate <= datetime.now():
+        now = session_now(session)
+        candidate = now.replace(hour=int(hour), minute=int(minute), second=0, microsecond=0)
+        if candidate <= now:
             candidate += timedelta(days=1)
         return candidate
     except (ValueError, AttributeError):
@@ -216,7 +222,7 @@ def _wait_for_astro_end(stop_fn, end_time, interrupted, session, camera_type="Te
         if status and not status.get("capturing"):
             return True
 
-        if end_time is not None and datetime.now() >= end_time:
+        if end_time is not None and session_now(session) >= end_time:
             log.notice(
                 f"Reached scheduled end time ({end_time:%H:%M}) - image count not finished, stopping capture now"
             )
@@ -355,7 +361,7 @@ def start_dwarf_session(program, stop_event=None, session=None, progress_callbac
             binning_val = str(program['setup_camera'].get('binning', "0"))
             IR_val = str(program['setup_camera'].get('ircut', "0"))
             count_val = str(program['setup_camera'].get('count', "0"))
-            end_time_val = _parse_end_time(program['setup_camera'].get('end_time', ''))
+            end_time_val = _parse_end_time(program['setup_camera'].get('end_time', ''), session)
 
             # Mosaic (tele-only, user-requested Sep 2026): a sub-section
             # of the tele capture settings, backward-compatible -
@@ -404,7 +410,7 @@ def start_dwarf_session(program, stop_event=None, session=None, progress_callbac
             wide_exp_val = str(program['setup_wide_camera'].get('exposure', "0"))
             wide_gain_val = str(program['setup_wide_camera'].get('gain', "0"))
             wide_count_val = str(program['setup_wide_camera'].get('count', "0"))  # Fix: use separate variable
-            wide_end_time_val = _parse_end_time(program['setup_wide_camera'].get('end_time', ''))
+            wide_end_time_val = _parse_end_time(program['setup_wide_camera'].get('end_time', ''), session)
 
             if wide_exp_val or wide_gain_val or wide_count_val:
                 log.notice(f" To do => Astro Wide Photo with these parameters")
@@ -431,6 +437,14 @@ def start_dwarf_session(program, stop_event=None, session=None, progress_callbac
         # Go Live
         continue_action = perform_GoLive(session=session)
         verify_action(continue_action, "step_1a", progress_callback=progress_callback)
+
+        # Megastack (components/megastack.py): the Dwarf stacks sessions it
+        # holds - none of the capture steps below
+        if session is not None:
+            from components import megastack
+            if megastack.megastack_section(program):
+                megastack.run(program, session, interrupted, progress_callback)
+                return
 
         # V3: switch the device into the right shooting mode + technique
         # (SWITCH_SHOOTING_MODE/ENTER_CAMERA/SWITCH_SHOOTING_TECH,
@@ -462,6 +476,41 @@ def start_dwarf_session(program, stop_event=None, session=None, progress_callbac
         # mode, not the Go Live call step_1a's own label actually
         # describes.
         verify_action(continue_action, "step_1e", progress_callback=progress_callback)
+
+        # Start position (components/end_of_night.py): the saved opening
+        # position or the polar position, asked by the program - or the
+        # saved one anyway when this app closed the lenses at the end of
+        # the night (a remote Dwarf must not stay closed)
+        if session is not None:
+            from components import end_of_night
+            start_mode = end_of_night.start_position_mode(session, program.get('id_command', {}).get('start_position'))
+            if end_of_night.has_accessory(session.dwarf_uid):
+                if end_of_night.is_closed_by_app(session.dwarf_uid):
+                    # Closed by this app a night before, the accessory mounted
+                    # since: not reopened here - the user opens it
+                    log.warning("Lenses closed by this app but an accessory is mounted: not reopened - open the Dwarf by hand")
+                    if progress_callback:
+                        progress_callback("Lenses closed by Dwarfium Lite, accessory mounted: not reopened - open the Dwarf by hand", "failed")
+                elif program.get('id_command', {}).get('start_position') not in (None, end_of_night.START_NONE):
+                    log.warning("Start position skipped: a bulky accessory is mounted (the Pitch reset would fold it)")
+                    if progress_callback:
+                        progress_callback("Start position skipped: accessory mounted", "success")
+            if start_mode != end_of_night.START_NONE:
+                if interrupted(): return
+                log.notice(f"Moving to the start position ({start_mode})")
+                continue_action = end_of_night.go_to_start_position(session, start_mode)
+                if interrupted(): return
+                verify_action(continue_action, "step_1f", progress_callback=progress_callback)
+
+        # The axes referenced before the EQ and the calibration (a reset goes
+        # to the limit and comes back to where the axis was): the Dwarf then
+        # gives the position after the calibration, saved as the initial one
+        # (components/end_of_night.py). Before the EQ, not between it and the
+        # calibration: a reset after the EQ might shift what it measured.
+        if session is not None and (eq_solving or calibration):
+            from components import end_of_night
+            end_of_night.ensure_axes_referenced(session)
+            if interrupted(): return
 
         # Auto Focus
         if auto_focus:
@@ -619,6 +668,14 @@ def start_dwarf_session(program, stop_event=None, session=None, progress_callbac
             continue_action = perform_calibration(session=session)
             if interrupted(): return
             verify_action(continue_action, "step_7", progress_callback=progress_callback)
+            # The Dwarf's motors initialized and the sky visible there: the
+            # opening position to go back to after closing the lenses
+            # (components/end_of_night.py)
+            if session is not None:
+                from components import end_of_night
+                position = end_of_night.read_position(session)
+                if position is not None:
+                    end_of_night.save_open_position(session.dwarf_uid, position, "auto")
             wait_after = program.get('calibration', {}).get('wait_after', 0)
             if interrupted(): return
             log.warning(f"Waiting for {wait_after} seconds")
@@ -642,15 +699,14 @@ def start_dwarf_session(program, stop_event=None, session=None, progress_callbac
         if goto_manual:
             target_name = program.get('goto_manual', {}).get('target')
             log.notice(f"Processing Goto : {target_name}")
-            try:
-                decimal_RA = float(manual_RA)
-            except ValueError:
-                decimal_RA = parse_ra_to_float(manual_RA)
-
-            try:
-                decimal_Dec = float(manual_declination)
-            except ValueError:
-                decimal_Dec = parse_dec_to_float(manual_declination)
+            # Decimal or sexagesimal, any usual notation (components/coords.py:
+            # the library's parsers only knew "HH:MM:SS" and dropped the Dec
+            # sign on minutes / seconds)
+            decimal_RA = parse_ra_hours(manual_RA)
+            decimal_Dec = parse_dec_degrees(manual_declination)
+            if decimal_RA is None or decimal_Dec is None:
+                log.error(f"Goto {target_name}: unreadable coordinates RA={manual_RA!r} Dec={manual_declination!r}")
+                verify_action(False, "step_9", progress_callback=progress_callback)  # raises
 
             continue_action = perform_goto(decimal_RA, decimal_Dec, target_name, session=session)
             if interrupted(): return
@@ -665,7 +721,10 @@ def start_dwarf_session(program, stop_event=None, session=None, progress_callbac
         if take_photo:
             log.notice(f"Processing Astro Photo Session : {count_val} images")
             if exp_val:
-                continue_action = perform_set_astro_exposure_by_name_v3(exp_val, dwarf_id=str(config_to_dwarf_id_str(dwarf_id)), session=session)
+                continue_action = _set_checked(
+                    "exposure", exp_val,
+                    lambda: perform_set_astro_exposure_by_name_v3(exp_val, dwarf_id=str(config_to_dwarf_id_str(dwarf_id)), session=session),
+                    dwarf_id, session)
                 if interrupted(): return
                 verify_action(continue_action, "step_10", progress_callback=progress_callback)
                 # Actual-value traces (user-requested Sep 2026: "affichage
@@ -677,7 +736,9 @@ def start_dwarf_session(program, stop_event=None, session=None, progress_callbac
                 if progress_callback:
                     progress_callback(f"Exposure: {exp_val}", "success")
             if gain_val:
-                continue_action = perform_set_astro_gain_v3(int(gain_val), session=session)
+                continue_action = _set_checked(
+                    "gain", gain_val, lambda: perform_set_astro_gain_v3(int(gain_val), session=session),
+                    dwarf_id, session)
                 if interrupted(): return
                 verify_action(continue_action, "step_10", progress_callback=progress_callback)
                 if progress_callback:
@@ -956,6 +1017,61 @@ def verify_action(result, action_step, progress_callback=None):
             progress_callback(action_step, "failed")
         raise RuntimeError(f"Action failed at step: {STEP_DESCRIPTIONS.get(action_step, action_step)}")
 
+def _camera_value(kind, dwarf_id, session):
+    """The Tele's current exposure name / gain value read from the Dwarf
+    (HTTP API, as print_camera_data()), None when not read."""
+    params = perform_read_camera_params_http_v3(mode_id=2, session=session)
+    cam = params.get("cameras", {}).get(0) if isinstance(params, dict) else None
+    info = (cam or {}).get(kind) or {}
+    if kind == "exposure":
+        # In Auto the stored manual value is read back but not used (user-
+        # reported Oct 2026: a DWARF 3 stuck in Auto, the official app
+        # couldn't set it either): not the value wanted
+        if info and not info.get("mode"):
+            return "Auto"
+        name = info.get("name")
+        if name is None and info.get("value") is not None:
+            name = get_exposure_name_by_index(info.get("value"), str(config_to_dwarf_id_str(dwarf_id)))
+        return None if name is None else str(name)
+    return None if info.get("value") is None else str(info.get("value"))
+
+
+def _same_value(kind, read, wanted) -> bool:
+    if read is None:
+        return False
+    if kind == "exposure":
+        return str(read).rstrip("s").strip() == str(wanted).rstrip("s").strip()
+    try:
+        return int(float(read)) == int(float(wanted))
+    except (TypeError, ValueError):
+        return False
+
+
+def _set_checked(kind, wanted, send, dwarf_id, session):
+    """Sends an exposure / gain setting and checks the Dwarf's answer (user-
+    reported Oct 2026: it answered -1 - refused - and verify_action() took
+    any answer for a success). Refused: asked again once; still refused,
+    the value read back from the Dwarf decides - already the one wanted
+    (the run before set it): goes on, said; else False (the step fails).
+    Returns the setting's result for verify_action()."""
+    result = send()
+    if result is False or result is True or result == 0:
+        return result
+    log.warning(f"Setting the {kind} to {wanted}: the Dwarf answered {result} (refused) - asked again")
+    time.sleep(2)
+    result = send()
+    if result is False or result is True or result == 0:
+        return result
+    current = _camera_value(kind, dwarf_id, session)
+    if _same_value(kind, current, wanted):
+        log.notice(f"The Dwarf refused the {kind} ({result}) but already has {current}: going on")
+        return 0
+    log.error(f"The Dwarf refused the {kind} {wanted} ({result}); it has {current if current is not None else 'an unknown value'}"
+              + (" - its exposure stays automatic: restart the Dwarf (the official app can't set it either then)"
+                 if current == "Auto" else ""))
+    return False
+
+
 def print_camera_data(session=None):
     camera_exposure = False
     camera_gain = False
@@ -990,6 +1106,8 @@ def print_camera_data(session=None):
         if exposure_info:
             auto_mode = exposure_info.get("mode")
             log.notice(f"The exposition mode is: {'Manual' if auto_mode else 'Auto'}")
+            if not auto_mode:
+                log.warning("The exposure is automatic: the exposure value below is not the one used")
             camera_exposure = exposure_info.get("name")
             if camera_exposure is None:
                 # fallback: resolve name from the raw index ourselves

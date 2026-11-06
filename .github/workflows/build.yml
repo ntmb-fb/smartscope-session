@@ -16,14 +16,14 @@ jobs:
 
     strategy:
       matrix:
-        os: [windows-latest, ubuntu-latest, macos-14]
+        os: [windows-latest, ubuntu-24.04, macos-15]
 
     steps:
       - name: 🔄 Checkout code
         uses: actions/checkout@v5
 
       - name: 🐍 Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.12'
 
@@ -34,12 +34,16 @@ jobs:
           pip install -r requirements-local.txt --target .
           pip install pyinstaller
 
+      - name: Install Pillow for icon conversion
+        if: runner.os == 'macOS'
+        run: python -m pip install Pillow
+
       - name: ⚙️ Run build script
         run: |
           python buildAstroDwarfUI.py
 
       - name: 📤 Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: zip-${{ github.ref_name }}-${{ runner.os }}
           path: AstroDwarfUI-${{ runner.os }}.zip
@@ -73,7 +77,7 @@ jobs:
           echo "FINAL_VERSION=$VERSION" >> $GITHUB_ENV
 
       - name: 📥 Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           path: downloads
 

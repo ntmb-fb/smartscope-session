@@ -80,7 +80,7 @@ import re
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from nicegui import background_tasks, run
 
@@ -96,7 +96,9 @@ from dwarf_python_api.lib.dwarf_utils import perform_is_camera_actually_busy
 from dwarf_python_api.lib.dwarf_utils import perform_read_astro_stacking_status_v3
 
 from components import connection_health
+from components.json_files import write_json_atomic
 from components.session_dirs import session_dirs_for
+from components.site_time import session_now, site_from_timestamp
 
 
 @dataclass
@@ -147,6 +149,11 @@ class RunState:
     # cover that.
     exposure_actual: str = ""
     gain_actual: str = ""
+    # A megastack's stack so far (components/megastack.py): its thumbnail
+    # on the Dwarf, re-read when preview_version (the images stacked)
+    # changes - "" for a capture
+    preview_url: str = ""
+    preview_version: int = 0
     # Filled LIVE from on_progress()'s own "Exposure:"/"Gain:"/"IR
     # Filter:" parsing below (user-requested Sep 2026: "les parametres
     # affiches ne sont pas bon, il se rafraichissent juste a la fin" -
@@ -193,7 +200,14 @@ class RunState:
 _runs: dict[str, RunState] = {}
 
 
-def _update_process_status(program: dict, status: str, *, result: bool | None = None, message: str | None = None) -> None:
+def _update_process_status(
+    program: dict,
+    status: str,
+    *,
+    result: bool | None = None,
+    message: str | None = None,
+    session=None,
+) -> None:
     """Field-for-field port of astro_dwarf_scheduler.py's own
     update_process_status() - same semantics, including the fact that
     passing status="done" always sets id_command['process']="done"
@@ -206,7 +220,9 @@ def _update_process_status(program: dict, status: str, *, result: bool | None = 
         command["result"] = result
     if message:
         command["message"] = message
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # Site time (components/site_time.py) - same clock as the program's
+    # own date/time, so realStart/realEnd line up with it.
+    now = session_now(session).strftime("%Y-%m-%d %H:%M:%S")
     if status == "pending":
         command["starting_date"] = now
     if status == "done":
@@ -214,8 +230,7 @@ def _update_process_status(program: dict, status: str, *, result: bool | None = 
 
 
 def _write_json(path: str, data: dict) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=4)
+    write_json_atomic(path, data)
 
 
 def _capture_actual_camera_settings(id_command: dict, session, is_wide: bool = False) -> None:
@@ -349,6 +364,19 @@ def is_running(dwarf_uid: str) -> bool:
     return bool(state and state.running)
 
 
+def program_capturing(session) -> bool:
+    """A program runs on this Dwarf and is in its capture step. The run
+    holds the command slot for its whole duration, but while it captures
+    it only reads the cached status (dwarf_session.py's
+    _wait_for_astro_end(), no command of its own until its end time or a
+    stop), so a light switch or the preview source can be sent then
+    without the slot instead of reporting the device busy all night."""
+    if not is_running(session.dwarf_uid) or not getattr(session, "is_connected", False):
+        return False
+    full_status = get_client_status(session).get("fullStatus") or {}
+    return bool(full_status.get("takePhotoStarted") or full_status.get("takeWidePhotoStarted"))
+
+
 # Generous safety ceiling (user-agreed Sep 2026, after a confirmed real
 # incident) - deliberately loose: a single program's capture step is
 # allowed to run essentially all night, since a long winter night in a
@@ -417,13 +445,28 @@ def check_stuck_runs() -> None:
     # recover on its own via the normal WebSocket layer.
     _DISCONNECTED_GRACE_SECONDS = 15
 
-    def _force_stop(dwarf_uid: str, state: RunState, reason: str) -> None:
+    def _force_stop(dwarf_uid: str, state: RunState, reason: str, keep_in_current: bool = False) -> None:
         log.warning(f"[{dwarf_uid}] Run force-stopped: {reason}")
         state.running = False
         state.finished_ok = False
         state.error = f"Run force-stopped: {reason}"
         state.force_stopped = True
         connection_health.release_command_slot(dwarf_uid)
+
+        if keep_in_current and state.program is not None and state.current_path is not None \
+                and os.path.exists(state.current_path):
+            # A network drop: the Dwarf goes on capturing. Left in Current/,
+            # the reconnection resumes following it (reconcile_orphaned_
+            # current_files) and records it once - written to Error/ here,
+            # the resume then wrote it to Done/ too (user-seen Oct 2026: the
+            # same run in Done and in Error).
+            id_command = state.program.setdefault("id_command", {})
+            id_command["message"] = f"Connection lost: {reason}"
+            try:
+                _write_json(state.current_path, {"command": state.program})
+            except OSError:
+                log.warning(f"[{dwarf_uid}] Could not update the interrupted run's file in Current/.")
+            return
 
         # The worker thread's own finally block normally does the Current->
         # Error file move (see _run_blocking()) - but a force-stopped run's
@@ -453,7 +496,7 @@ def check_stuck_runs() -> None:
                         full_program = {"command": program}
                         error_path = os.path.join(dirs["ERROR_DIR"], os.path.basename(state.current_path))
                         os.makedirs(dirs["ERROR_DIR"], exist_ok=True)
-                        _update_process_status(full_program, "done")
+                        _update_process_status(full_program, "done", session=session)
                         _write_json(error_path, full_program)
                         os.remove(state.current_path)
                         state.last_saved_path = error_path
@@ -483,6 +526,7 @@ def check_stuck_runs() -> None:
                 state,
                 f"session disconnected and slot still held {duration:.0f}s later "
                 "(likely a leaked thread after a network drop).",
+                keep_in_current=True,
             )
             continue
 
@@ -493,6 +537,53 @@ def check_stuck_runs() -> None:
                 f"slot held {duration:.0f}s > {_MAX_RUN_SECONDS}s - far longer than "
                 "any real capture should take (likely a leaked thread).",
             )
+
+
+def _capture_confirmed(state) -> bool:
+    """The Dwarf accepted this run's capture start (Tele or Wide)."""
+    return any(ev.key in ("step_11", "step_14") and ev.status == "success" for ev in state.steps)
+
+
+def _keep_following(session, state, program, id_command, current_path, error) -> None:
+    """A run whose capture started and whose following failed: left in
+    Current/, then followed again - at once when the Dwarf answers that it
+    still captures (_resume_capture), filed by what it saved when it says
+    it stopped, else left for the reconnection (reconcile_orphaned_current_
+    files). Never stops the capture."""
+    dwarf_uid = session.dwarf_uid
+    id_command["message"] = f"Capture going on on the Dwarf, its following interrupted: {error}"
+    if current_path is not None:
+        try:
+            _write_json(current_path, {"command": program})
+        except OSError:
+            pass
+    state.error = id_command["message"]
+    state.running = False
+    connection_health.release_command_slot(dwarf_uid)
+    log.warning(f"[{dwarf_uid}] {id_command['message']} - followed again.")
+    if current_path is None:
+        return
+    capturing = _device_capture_state(session)
+    if capturing is None:
+        return      # no answer: the reconnection follows it again
+    dirs = session_dirs_for(session)
+    filename = os.path.basename(current_path)
+    if capturing:
+        _resume_capture(dwarf_uid, session, dirs, filename, current_path, program, id_command)
+    else:
+        _finalize_orphan_ended_on_device(dwarf_uid, session, dirs, filename, current_path, program, id_command)
+
+
+def has_program_in_progress(session) -> bool:
+    """A program of this Dwarf running here, or left in its Current/ folder
+    (followed again once reconnected)."""
+    if is_running(session.dwarf_uid):
+        return True
+    try:
+        folder = session_dirs_for(session)["CURRENT_DIR"]
+        return any(f.lower().endswith(".json") for f in os.listdir(folder))
+    except (OSError, KeyError):
+        return False
 
 
 def reconcile_after_reconnect(dwarf_uid: str, session) -> None:
@@ -541,7 +632,7 @@ def reconcile_after_reconnect(dwarf_uid: str, session) -> None:
     _set_dwarf_field(id_command, session)
 
     dirs = session_dirs_for(session)
-    starting_date = id_command.get("starting_date", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    starting_date = id_command.get("starting_date", session_now(session).strftime("%Y-%m-%d %H:%M:%S"))
     dt_str = starting_date.replace(":", "-").replace(" ", "-")
     new_filename_base = re.sub(
         r"^\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}_", "", os.path.basename(state.last_saved_path)
@@ -550,7 +641,7 @@ def reconcile_after_reconnect(dwarf_uid: str, session) -> None:
     os.makedirs(dirs["DONE_DIR"], exist_ok=True)
 
     full_program = {"command": program}
-    _update_process_status(full_program, "done")
+    _update_process_status(full_program, "done", session=session)
     _write_json(done_path, full_program)
     if os.path.exists(state.last_saved_path):
         os.remove(state.last_saved_path)
@@ -562,7 +653,11 @@ def reconcile_after_reconnect(dwarf_uid: str, session) -> None:
     state.last_saved_path = done_path
     log.notice(f"[{dwarf_uid}] Force-stopped run reconciled as successful after reconnect ({current_count}/{requested}).")
 
-_ORPHAN_CORRELATION_MAX_AGE_S = 300
+# A program left in Current/ by a restart is resumed when its last step
+# (usually the capture start - nothing is recorded while it captures) is
+# at most this old (user-requested Oct 2026: "pas plus de 15h", a whole
+# night), unless the Dwarf reports capturing another target.
+_ORPHAN_CORRELATION_MAX_AGE_S = 15 * 3600
 
 def _requeue_orphan_to_todo(dwarf_uid, dirs, filename, path, program, id_command) -> None:
     """Puts an interrupted-before-any-real-progress session back into
@@ -592,10 +687,100 @@ def _requeue_orphan_to_todo(dwarf_uid, dirs, filename, path, program, id_command
 
 _RESUME_POLL_INTERVAL_S = 2
 _RESUME_BUSY_CHECK_EVERY_S = 20  # how often to cross-check with a FRESH device query
+_RESUME_SILENT_RECONNECT_S = 10 * 60  # no answer and no new image that long: reconnected
+_RESUME_UNKNOWN_MAX_S = 40 * 60  # still that long (no reconnection): the end
 _RESUME_ACQUIRE_ATTEMPTS = 3
 _RESUME_ACQUIRE_DELAY_S = 3
 
-def _wait_for_resumed_capture(session, camera_type, requested_count, interrupted) -> int:
+_LOW_BATTERY_PCT = 10
+
+
+def _early_stop_note(id_command: dict, session, program: dict) -> str:
+    """" - stopped by the Dwarf at 139/400: battery empty (5%)" when the
+    capture ended short of its count, not at the program's end time
+    (user-asked Oct 2026: the Mini powered off at 6 %, a DWARF 3 stopped at
+    5 % - both read "Session completed successfully"); "" otherwise. The
+    battery is the client's last level (CMD_NOTIFY_ELE / device state),
+    a POWER OFF notification counts as empty. Also writes battery_end."""
+    camera = "setup_wide_camera" if (program.get("setup_wide_camera") or {}).get("do_action") \
+        and not (program.get("setup_camera") or {}).get("do_action") else "setup_camera"
+    try:
+        requested = int((program.get(camera) or {}).get("count") or 0)
+        taken = int(id_command.get("shots_taken") or 0)
+    except (TypeError, ValueError):
+        return ""
+    if not requested or taken >= requested:
+        return ""
+    end_time = _program_end_time(program, camera, session_now(session))
+    if end_time is not None and session_now(session) >= end_time - timedelta(minutes=2):
+        return ""   # its end time: stopped as asked
+    client = getattr(session, "client_instance", None)
+    battery = getattr(client, "BatteryLevelDwarf", None)
+    charging = getattr(client, "IsChargingDwarf", None)
+    power_off = bool(getattr(client, "PowerOffNotified", False))
+    if battery is not None:
+        id_command["battery_end"] = battery
+    note = f" - stopped by the Dwarf at {taken}/{requested}"
+    if power_off or (battery is not None and battery <= _LOW_BATTERY_PCT and charging is not True):
+        note += ": battery empty" + (f" ({battery}%)" if battery is not None else "")
+        log.warning(f"[{session.dwarf_uid}] Capture stopped by the Dwarf at {taken}/{requested}: battery empty"
+                    + (f" ({battery}%)" if battery is not None else " (power off)"))
+    return note
+
+def _program_end_time(program: dict, camera_key: str, now: datetime | None = None) -> datetime | None:
+    """End time of a resumed program (user-reported Oct 2026: not applied
+    after a restart, so a capture could run long past it). Anchored on the
+    program's actual start (starting_date, written when it was launched),
+    else its scheduled date/time - not "the next HH:MM from now" like
+    dwarf_session._parse_end_time(), which would push an end time already
+    past to the next day: end_time "06:10" for a start at 22:39 is 06:10
+    the next morning.
+
+    A program run again from an older file keeps its old date/time (user-
+    seen Oct 2026: a capture stopped at 03:22, "end time 06:40 reached" -
+    the 06:40 of the day before): an end more than 12 h past is not this
+    run's, the next HH:MM is. None when blank or unparseable."""
+    value = (program.get(camera_key) or {}).get("end_time") or ""
+    id_command = program.get("id_command") or {}
+    anchor = id_command.get("starting_date") or f"{id_command.get('date', '')} {id_command.get('time', '')}".strip()
+    try:
+        hour, minute = str(value).strip().split(":")
+        start = datetime.strptime(anchor, "%Y-%m-%d %H:%M:%S")
+        end = start.replace(hour=int(hour), minute=int(minute), second=0, microsecond=0)
+    except (ValueError, AttributeError, TypeError):
+        return None
+    if end <= start:
+        end += timedelta(days=1)
+    if now is not None:
+        while now - end > timedelta(hours=12):
+            end += timedelta(days=1)
+    return end
+
+
+def _normalized_name(name) -> str:
+    return " ".join(str(name or "").lower().split())
+
+
+def device_target_match(session, program: dict) -> bool | None:
+    """Compares the target the Dwarf reports it is capturing (its
+    notifications' target_name, dwarf_python_api's "CurrentTargetName")
+    with this program's goto target: True (the program it is still
+    running), False (another target), None (either name unknown)."""
+    from components.current_activity import program_target  # local: imports this module
+
+    status = get_client_status(session)
+    device_name = _normalized_name((status.get("fullStatus") or {}).get("CurrentTargetName"))
+    target = _normalized_name(program_target({"command": program}))
+    if not device_name or not target:
+        return None
+    return device_name == target or target in device_name or device_name in target
+
+
+def device_target_matches(session, program: dict) -> bool:
+    return device_target_match(session, program) is True
+
+
+def _wait_for_resumed_capture(session, camera_type, requested_count, interrupted, end_time=None) -> int:
     """Returns the final current_count once the resumed capture is
     considered finished.
 
@@ -618,6 +803,8 @@ def _wait_for_resumed_capture(session, camera_type, requested_count, interrupted
     the target."""
     last_count = 0
     last_busy_check_at = 0.0
+    unknown_since = None    # the Dwarf not answering the busy check since
+    reconnect_asked = False
 
     while not interrupted():
         status = perform_read_astro_stacking_status_v3(session=session, type=camera_type)
@@ -631,14 +818,47 @@ def _wait_for_resumed_capture(session, camera_type, requested_count, interrupted
 
         if requested_count and current_count >= requested_count:
             return current_count
+        if end_time is not None and session_now(session) >= end_time:
+            # The program's end time (the caller stops the capture)
+            return current_count
 
         now = time.monotonic()
         if now - last_busy_check_at >= _RESUME_BUSY_CHECK_EVERY_S:
             last_busy_check_at = now
-            if not device_is_actively_capturing(session):
+            capturing = _device_capture_state(session)
+            if capturing is False:
                 # Confirmed by a fresh query, not the stale local flag -
                 # the device genuinely isn't shooting anymore.
                 return current_count
+            if capturing is None:
+                # No answer (user's Mini, Oct 2026: one GET_DEVICE_STATE_INFO
+                # timed out at 00:45, the run filed in Error at 30/200 - the
+                # Mini went on to 190 images): not an end. Given up only
+                # when it lasts and the count no longer moves.
+                if unknown_since is None:
+                    unknown_since = (now, current_count)
+                    log.warning(f"[{session.dwarf_uid}] Resumed capture: the Dwarf didn't answer its state - "
+                                "still followed.")
+                elif current_count != unknown_since[1]:
+                    unknown_since = (now, current_count)
+                elif now - unknown_since[0] >= _RESUME_UNKNOWN_MAX_S:
+                    log.warning(f"[{session.dwarf_uid}] Resumed capture: no answer and no new image for "
+                                f"{_RESUME_UNKNOWN_MAX_S // 60} min - its end taken as now.")
+                    return current_count
+                elif not reconnect_asked and now - unknown_since[0] >= _RESUME_SILENT_RECONNECT_S:
+                    # Silent while the connection looks open: closed, so the
+                    # watchdog hands the run back (kept in Current/), the
+                    # auto-reconnection reconnects and resumes following it
+                    reconnect_asked = True
+                    log.warning(f"[{session.dwarf_uid}] Resumed capture: no answer and no new image for "
+                                f"{_RESUME_SILENT_RECONNECT_S // 60} min - reconnecting.")
+                    try:
+                        from dwarf_python_api.lib.dwarf_utils import perform_disconnect
+                        perform_disconnect(session=session)
+                    except Exception as e:
+                        log.warning(f"[{session.dwarf_uid}] Disconnect before reconnecting failed: {e}")
+            else:
+                unknown_since = None
 
         time.sleep(_RESUME_POLL_INTERVAL_S)
 
@@ -685,26 +905,41 @@ def _resume_capture(dwarf_uid, session, dirs, filename, path, program, id_comman
         return
 
     def interrupted() -> bool:
-        return state.stop_requested
+        # force_stopped: the watchdog took the run back (connection lost) -
+        # this thread stops following, the reconnection resumes it
+        return state.stop_requested or state.force_stopped
 
     success = True
     try:
         try:
             if take_photo:
                 requested = _parse_requested_count(state.requested_count_tele)
-                final_count = _wait_for_resumed_capture(session, "Tele", requested, interrupted)
+                end_time = _program_end_time(program, "setup_camera", session_now(session))
+                final_count = _wait_for_resumed_capture(session, "Tele", requested, interrupted, end_time)
+                if state.force_stopped:
+                    return      # left in Current/: resumed again on reconnection
                 if interrupted():
                     perform_stopAstroPhoto(session=session)
                     success = False
+                elif end_time is not None and session_now(session) >= end_time:
+                    # End time reached: stopped like a normal run does
+                    log.notice(f"[{dwarf_uid}] Resumed capture: end time {end_time:%H:%M} reached - stopping.")
+                    perform_stopAstroPhoto(session=session)
                 elif requested and final_count < requested:
                     success = False  # device stopped short of the target
 
             if success and take_widephoto:
                 requested = _parse_requested_count(state.requested_count_wide)
-                final_count = _wait_for_resumed_capture(session, "Wide", requested, interrupted)
+                end_time = _program_end_time(program, "setup_wide_camera", session_now(session))
+                final_count = _wait_for_resumed_capture(session, "Wide", requested, interrupted, end_time)
+                if state.force_stopped:
+                    return
                 if interrupted():
                     perform_stopAstroWidePhoto(session=session)
                     success = False
+                elif end_time is not None and session_now(session) >= end_time:
+                    log.notice(f"[{dwarf_uid}] Resumed capture: end time {end_time:%H:%M} reached - stopping.")
+                    perform_stopAstroWidePhoto(session=session)
                 elif requested and final_count < requested:
                     success = False
         except Exception as e:
@@ -723,8 +958,8 @@ def _resume_capture(dwarf_uid, session, dirs, filename, path, program, id_comman
         id_command["message"] = (
             "Session completed successfully (resumed after restart)"
             if success else "Session failed (resumed after restart)"
-        )
-        _update_process_status(full_program, "done")
+        ) + _early_stop_note(id_command, session, program)
+        _update_process_status(full_program, "done", session=session)
 
         dest_dir = dirs["DONE_DIR"] if success else dirs["ERROR_DIR"]
         dest_path = os.path.join(dest_dir, filename)
@@ -745,6 +980,114 @@ def _resume_capture(dwarf_uid, session, dirs, filename, path, program, id_comman
         connection_health.release_command_slot(dwarf_uid)
 
 
+# Current/ files already reported as unreadable (warned once, not every tick)
+_unreadable_warned: set[str] = set()
+
+
+def _warn_unreadable(path: str, error: Exception) -> None:
+    """A Current/ file that isn't valid JSON (e.g. hand-edited, user-
+    reported Oct 2026: a trailing comma) was skipped silently, so its
+    program was never resumed - now logged once per file and error."""
+    key = f"{path}|{error}"
+    if key not in _unreadable_warned:
+        _unreadable_warned.add(key)
+        log.warning(f"Program file not readable, skipped: {path} ({error})")
+
+
+def orphan_matching_device_target(session) -> str | None:
+    """Cheap check for scheduler_loop's resume retry (no device command):
+    the newest Current/ file of this device when its program's target is
+    the one the Dwarf reports capturing, else None. reconcile_orphaned_
+    current_files() runs right after a reconnect, usually before the
+    Dwarf's first progress notification has brought the target name."""
+    if is_running(session.dwarf_uid):
+        return None
+    current_dir = session_dirs_for(session)["CURRENT_DIR"]
+    try:
+        files = [f for f in os.listdir(current_dir) if f.endswith(".json")]
+    except OSError:
+        return None
+    if not files:
+        return None
+    newest = max(files, key=lambda f: os.path.getmtime(os.path.join(current_dir, f)))
+    try:
+        with open(os.path.join(current_dir, newest), "r", encoding="utf-8") as f:
+            full_program = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        _warn_unreadable(os.path.join(current_dir, newest), e)
+        return None
+    program = full_program.get("command", full_program)
+    return newest if device_target_matches(session, program) else None
+
+
+def _error_time(id_command: dict, session) -> datetime | None:
+    for key in ("processed_date", "last_step_time"):
+        try:
+            return datetime.strptime(str(id_command.get(key) or ""), "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            continue
+    return None
+
+
+def can_force_resume(dwarf_uid: str, session, program: dict) -> bool:
+    """Programs page's "Force resume" button for a program in Error/
+    (user-requested Oct 2026, e.g. a run ended in error after 3 failed
+    attempts while the Dwarf went on capturing): shown when no run is in
+    progress, the Dwarf is connected and capturing this program's target
+    (CurrentTargetName) and the error is at most _ORPHAN_CORRELATION_
+    MAX_AGE_S old. Cheap: no device command."""
+    if is_running(dwarf_uid) or not getattr(session, "is_connected", False):
+        return False
+    full_status = get_client_status(session).get("fullStatus") or {}
+    capturing = full_status.get("takePhotoStarted") or full_status.get("takeWidePhotoStarted") or full_status.get("AstroCapture")
+    if not capturing or not device_target_matches(session, program):
+        return False
+    when = _error_time(program.get("id_command") or {}, session)
+    return when is not None and (session_now(session) - when).total_seconds() <= _ORPHAN_CORRELATION_MAX_AGE_S
+
+
+def force_resume_from_error(dwarf_uid: str, session, filepath: str) -> bool:
+    """Moves an Error/ program back to Current/ as an interrupted run
+    (process "pending", last step = now; dwarf, shots_taken/stacked and
+    processed_date removed) and runs the normal resume check, which
+    confirms with a fresh device query that it is capturing this target.
+    Blocking (run.io_bound). True when the resume started."""
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            full_program = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        _warn_unreadable(filepath, e)
+        return False
+    program = full_program.get("command", full_program)
+    id_command = program.setdefault("id_command", {})
+    id_command["process"] = "pending"
+    id_command["result"] = False
+    id_command["message"] = "Resume forced after an error"
+    id_command["last_step"] = "Resume forced"
+    id_command["last_step_time"] = session_now(session).strftime("%Y-%m-%d %H:%M:%S")
+    for key in ("dwarf", "shots_taken", "shots_stacked", "processed_date"):
+        id_command.pop(key, None)
+
+    dirs = session_dirs_for(session)
+    os.makedirs(dirs["CURRENT_DIR"], exist_ok=True)
+    current_path = os.path.join(dirs["CURRENT_DIR"], os.path.basename(filepath))
+    try:
+        _write_json(current_path, {"command": program})
+        os.remove(filepath)
+    except OSError as e:
+        log.warning(f"[{dwarf_uid}] Could not move {filepath} back to Current/: {e}")
+        return False
+    log.notice(f"[{dwarf_uid}] Resume forced: {os.path.basename(filepath)} moved back to Current/.")
+
+    if not connection_health.try_acquire_command_slot(dwarf_uid, caller="scheduler_runner.force_resume"):
+        return False  # left in Current/: resumed by the next reconnect / target check
+    try:
+        reconcile_orphaned_current_files(dwarf_uid, session)
+    finally:
+        connection_health.release_command_slot(dwarf_uid)
+    return True
+
+
 def reconcile_orphaned_current_files(dwarf_uid: str, session) -> None:
     if dwarf_uid in _runs and _runs[dwarf_uid].running:
         return
@@ -763,7 +1106,8 @@ def reconcile_orphaned_current_files(dwarf_uid: str, session) -> None:
             with open(path, "r", encoding="utf-8") as f:
                 full_program = json.load(f)
             program = full_program.get("command", full_program)
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError) as e:
+            _warn_unreadable(path, e)
             continue
         id_command = program.setdefault("id_command", {})
         last_step_time = id_command.get("last_step_time")
@@ -773,7 +1117,7 @@ def reconcile_orphaned_current_files(dwarf_uid: str, session) -> None:
             ts = None
         if ts is None:
             try:
-                ts = datetime.fromtimestamp(os.path.getmtime(path))
+                ts = site_from_timestamp(os.path.getmtime(path), getattr(session, "config", None))
             except OSError:
                 ts = datetime.min
         parsed.append((ts, filename, path, program, id_command))
@@ -789,10 +1133,21 @@ def reconcile_orphaned_current_files(dwarf_uid: str, session) -> None:
         _finalize_orphan_to_error(dwarf_uid, dirs, filename, path, program, id_command)
 
     ts, filename, path, program, id_command = newest
-    device_busy = device_is_actively_capturing(session)
+    device_busy = _device_capture_state(session)
+    if device_busy is None:
+        # No answer: can't tell - left in Current/ for the next connection
+        # (never filed nor requeued on a guess)
+        log.warning(f"[{dwarf_uid}] Program in progress {filename}: the Dwarf didn't answer its state - left as is.")
+        return
     if device_busy:
-        age = (datetime.now() - ts).total_seconds()
-        if age <= _ORPHAN_CORRELATION_MAX_AGE_S:
+        age = (session_now(session) - ts).total_seconds()
+        # The Dwarf reports this program's target, or no target name yet
+        # and a last step within _ORPHAN_CORRELATION_MAX_AGE_S (user-
+        # reported Oct 2026: last step at 22:39 - the capture start - and
+        # a restart at 01:00 wasn't resumed with the former 5 min limit).
+        # Never when the Dwarf reports capturing another target.
+        match = device_target_match(session, program)
+        if match is True or (match is None and age <= _ORPHAN_CORRELATION_MAX_AGE_S):
             background_tasks.create(
                 run.io_bound(
                     _resume_capture, dwarf_uid, session, dirs, filename, path, program, id_command
@@ -800,7 +1155,96 @@ def reconcile_orphaned_current_files(dwarf_uid: str, session) -> None:
                 name=f"resume-orphan-{dwarf_uid}",
             )
         return
+    if _capture_had_started(id_command):
+        # The Dwarf captures on its own once started: the app stopped
+        # (a Windows update at 4:30, user-reported Oct 2026) and the
+        # capture went on to its end - requeued, it would be run again
+        _finalize_orphan_ended_on_device(dwarf_uid, session, dirs, filename, path, program, id_command)
+        return
     _requeue_orphan_to_todo(dwarf_uid, dirs, filename, path, program, id_command)
+
+
+# Last steps once the capture has started (dwarf_session.STEP_DESCRIPTIONS)
+_CAPTURE_STEP_LABELS = {STEP_DESCRIPTIONS[k] for k in ("step_11", "step_12", "step_14", "step_15", "step_16")}
+
+
+def _capture_had_started(id_command: dict) -> bool:
+    return id_command.get("last_step") in _CAPTURE_STEP_LABELS
+
+
+def _album_check(session, program: dict) -> dict | None:
+    """What the Dwarf saved for this program, from its album (task_check:
+    the session of its target within its window, and its shotsInfo.json
+    - images taken / stacked). None when it can't be told (album not
+    reachable, session not found, no shotsInfo.json). Blocking, HTTP."""
+    from components import task_check   # lazy: it imports pages
+    try:
+        task = task_check.program_task(program, getattr(session, "config", None))
+        if task is None:
+            return None
+        summary = task_check.summarize(session, task)
+    except Exception as e:
+        log.warning(f"[{session.dwarf_uid}] Album check of an orphaned program failed: {e}")
+        return None
+    return summary if summary.get("status") in ("ok", "empty") else None
+
+
+def _finalize_orphan_ended_on_device(dwarf_uid, session, dirs, filename, path, program, id_command) -> None:
+    """A Current/ program whose capture had started, the Dwarf no longer
+    capturing: it ended on the Dwarf while the app was stopped - never
+    back to ToDo. How it ended comes from the Dwarf's album (images taken
+    and stacked for that session): to Done when it reached the count
+    asked, to Error when fewer images or none stacked. When the album
+    can't tell, from the Dwarf's counters if it still reports them, else
+    to Done, marked as not confirmed."""
+    take_photo = program.get("setup_camera", {}).get("do_action")
+    requested = (program.get("setup_camera", {}).get("count") if take_photo
+                 else program.get("setup_wide_camera", {}).get("count")) or ""
+    _set_dwarf_field(id_command, session)
+    id_command["count_info"] = requested
+    try:
+        asked = int(requested or 0)
+    except (TypeError, ValueError):
+        asked = 0
+
+    album = _album_check(session, program)
+    if album is not None:
+        id_command["shots_taken"], id_command["shots_stacked"] = album.get("taken"), album.get("stacked")
+        source = "confirmed by its album"
+    else:
+        _capture_shots_result(id_command, session)
+        source = "its end was not followed"
+    try:
+        taken = int(id_command.get("shots_taken") or 0)
+    except (TypeError, ValueError):
+        taken = 0
+
+    if album is not None and album.get("status") == "empty":
+        failed, message = True, "Capture ended on the Dwarf while the app was stopped, no image stacked (its album)"
+    elif taken and asked and taken < asked:
+        failed = True
+        message = f"Capture stopped on the Dwarf before its end ({taken}/{asked}) while the app was stopped ({source})"
+    else:
+        failed = False
+        counts = f" - {taken} taken, {id_command.get('shots_stacked')} stacked" if album is not None else ""
+        message = f"Capture ended on the Dwarf while the app was stopped ({source}){counts}"
+    status, result, dest_dir = ("error", False, dirs["ERROR_DIR"]) if failed else ("done", True, dirs["DONE_DIR"])
+
+    starting_date = id_command.get("starting_date") or session_now(session).strftime("%Y-%m-%d %H:%M:%S")
+    dt_str = starting_date.replace(":", "-").replace(" ", "-")
+    new_filename = f"{dt_str}_" + re.sub(r"^\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}_", "", filename)
+    full_program = {"command": program}
+    _update_process_status(full_program, status, result=result, message=message, session=session)
+    if status == "error":
+        id_command["processed_date"] = session_now(session).strftime("%Y-%m-%d %H:%M:%S")
+    os.makedirs(dest_dir, exist_ok=True)
+    try:
+        _write_json(os.path.join(dest_dir, new_filename), full_program)
+        os.remove(path)
+        log.notice(f"[{dwarf_uid}] Orphaned Current/ file: capture ended on the Dwarf, moved to "
+                   f"{'Error' if failed else 'Done'}: {filename} ({message})")
+    except OSError:
+        log.warning(f"[{dwarf_uid}] Could not move orphaned file {filename} out of Current/.")
 
 def _finalize_orphan_to_error(dwarf_uid, dirs, filename, path, program, id_command) -> None:
     id_command["process"] = "error"
@@ -839,6 +1283,36 @@ def device_is_actively_capturing(session) -> bool:
         return False
     return perform_is_camera_actually_busy(session=session)
 
+def _device_capture_state(session) -> bool | None:
+    """True / False: a camera of the Dwarf runs an exclusive activity (a
+    capture) or not, from a fresh GET_DEVICE_STATE_INFO; None when it can't
+    be told - not connected, no answer (timeout), no state received. Unlike
+    device_is_actively_capturing(), which fails open (False) - right before
+    starting a program, wrong for a capture being followed."""
+    from dwarf_python_api.lib import websockets_utils
+    from dwarf_python_api.lib.dwarf_utils import perform_get_device_state_info
+    if not session.is_connected:
+        return None
+    code = perform_get_device_state_info(session=session)
+    if code == websockets_utils.ERROR_SLAVEMODE:
+        return True
+    if code != 0:
+        return None
+    info = getattr(getattr(session, "client_instance", None), "last_device_state_info", None)
+    if info is None:
+        return None
+    for camera in (info.tele_camera_state_info, info.wide_camera_state_info):
+        which = camera.exclusive_state.WhichOneof("current_state")
+        if which and getattr(getattr(camera.exclusive_state, which), "state", None) == 1:   # OPERATION_STATE_RUNNING
+            return True
+    return False
+
+
+# How long a run start waits for a health check already in flight to give
+# the slot back (usually a few seconds) before giving up for this try.
+_SLOT_WAIT_S = 30
+
+
 def _run_starting_blocking(
     dwarf_uid,
     program,
@@ -848,21 +1322,51 @@ def _run_starting_blocking(
 ):
     # This is now running in the io_bound worker thread.
     try:
-        if device_is_actively_capturing(session):
+        # A task of the Dwarf's own (a megastack, maybe started by the
+        # official app): nothing else can run meanwhile
+        from components import device_task
+        reason = device_task.busy_reason(session)
+        if reason:
+            state.running = False
+            state.error = reason[0].upper() + reason[1:] + " - the program will start after it."
+            return
+
+        # The slot BEFORE device_is_actively_capturing()'s own
+        # GET_DEVICE_STATE_INFO, not after (user-reported Oct 2026: a
+        # mosaic night lost 150s between 3 of its 5 tile changes). A
+        # health check that grabbed the slot just as the previous tile
+        # ended sent the same command at the same time: both share one
+        # result queue, one answer got taken by the other request, and
+        # the start waited for gb_timeout. priority_pending (set by
+        # start_run()) already keeps NEW health checks out, so only an
+        # in-flight one is waited for here.
+        acquired = False
+        deadline = time.monotonic() + _SLOT_WAIT_S
+        while True:
+            acquired = connection_health.try_acquire_command_slot(
+                dwarf_uid,
+                caller="scheduler_runner.start_run",
+            )
+            if acquired or time.monotonic() >= deadline:
+                break
+            time.sleep(1.0)
+        if not acquired:
+            state.running = False
+            state.error = "A command is already in progress for this device."
+            return
+
+        try:
+            capturing = device_is_actively_capturing(session)
+        except Exception:
+            connection_health.release_command_slot(dwarf_uid)
+            raise
+        if capturing:
+            connection_health.release_command_slot(dwarf_uid)
             state.running = False
             state.error = (
                 "The Dwarf is already capturing - "
                 "refusing to start a new session."
             )
-            return
-
-        acquired = connection_health.try_acquire_command_slot(
-            dwarf_uid,
-            caller="scheduler_runner.start_run",
-        )
-        if not acquired:
-            state.running = False
-            state.error = "A command is already in progress for this device."
             return
     finally:
         # try/finally (not a plain call after the acquire, as in an
@@ -880,6 +1384,15 @@ def _run_starting_blocking(
         source_filepath,
     )
 
+def _reset_capture_counts(session) -> None:
+    client = getattr(session, "client_instance", None)
+    if client is not None and hasattr(client, "initialize_count"):
+        try:
+            client.initialize_count()
+        except Exception:
+            pass
+
+
 def _run_blocking(
     program: dict, session, state: RunState, source_filepath: str | None
 ) -> None:
@@ -896,6 +1409,10 @@ def _run_blocking(
     full_program = {"command": program}
     id_command = program.setdefault("id_command", {})
     current_path = None
+    # The previous capture's counts are still in the client until this
+    # capture's first progress (user-seen Oct 2026: "1/13" shown at a
+    # program's start, then 0/0)
+    _reset_capture_counts(session)
 
     if source_filepath is not None:
         dirs = session_dirs_for(session)
@@ -919,8 +1436,8 @@ def _run_blocking(
         id_command.pop("ir_actual", None)
         id_command.pop("eq_azimut_error", None)
         id_command.pop("eq_altitude_error", None)
-        _update_process_status(full_program, "pending")
-        id_command["time"] = datetime.now().strftime("%H:%M:%S")
+        _update_process_status(full_program, "pending", session=session)
+        id_command["time"] = session_now(session).strftime("%H:%M:%S")
         _write_json(current_path, full_program)
 
     # Stashed on RunState so check_stuck_runs()'s _force_stop() can finalize
@@ -938,9 +1455,11 @@ def _run_blocking(
         label = STEP_DESCRIPTIONS.get(step_key, step_key)
         state.steps.append(StepEvent(key=step_key, label=label, status=status, seq=seq))
 
-        if current_path is not None:
+        # Not after a force-stop: the stuck call returning late recreated
+        # the file in Current/, and it was resumed and recorded a second time
+        if current_path is not None and not state.force_stopped:
             id_command["last_step"] = label
-            id_command["last_step_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            id_command["last_step_time"] = session_now(session).strftime("%Y-%m-%d %H:%M:%S")
             try:
                 _write_json(current_path, full_program)
             except OSError:
@@ -975,6 +1494,7 @@ def _run_blocking(
     max_retries = max(1, min(10, max_retries))
 
     succeeded = False
+    capture_lost = False
     last_exception: Exception | None = None
     attempt = 0
 
@@ -992,6 +1512,15 @@ def _run_blocking(
         except Exception as e:  # noqa: BLE001 - matches retry_procedure()'s own broad catch
             last_exception = e
             seq += 1
+            if _capture_confirmed(state) and not state.stop_event.is_set():
+                # The capture runs on the Dwarf (user-set rule, Oct 2026): only
+                # its end, the Dwarf's stop or Stop end it - never run again
+                # from its goto (that would stop it). Followed again below.
+                capture_lost = True
+                state.steps.append(StepEvent(
+                    key="retry", label=f"Capture following interrupted: {e} - followed again, the capture goes on",
+                    status="failed", seq=seq))
+                break
             will_retry = attempt < max_retries and not state.stop_event.is_set()
             state.steps.append(
                 StepEvent(
@@ -1017,6 +1546,10 @@ def _run_blocking(
         log.warning(f"[{session.dwarf_uid}] Stuck call finally returned after force-stop - discarding its stale result.")
         return
 
+    if capture_lost:
+        _keep_following(session, state, program, id_command, current_path, last_exception)
+        return
+
     try:
         if succeeded:
             state.finished_ok = True
@@ -1025,14 +1558,24 @@ def _run_blocking(
             id_command["result"] = True
             id_command["message"] = "Session completed successfully"
             _set_dwarf_field(id_command, session)
-            _capture_actual_camera_settings(
-                id_command, session,
-                is_wide=bool(program.get("setup_wide_camera", {}).get("do_action")),
-            )
-            _capture_eq_solving_result(id_command, session)
-            _capture_shots_result(id_command, session)
-            id_command["count_info"] = state.requested_count_tele if state.requested_count_tele else state.requested_count_wide
-            id_command["mosaic_info"] =  program.get("setup_camera", {}).get("doMosaic") and program.get("setup_camera", {}).get("do_action")
+            from components.megastack import megastack_section
+            if megastack_section(program):
+                # A megastack: no capture - its counts (and total exposure)
+                # are already in id_command (components/megastack.py), not
+                # the camera's settings of the moment (user-seen: the Sun's
+                # 1/10000 shown as its exposure)
+                pass
+            else:
+                _capture_actual_camera_settings(
+                    id_command, session,
+                    is_wide=bool(program.get("setup_wide_camera", {}).get("do_action")),
+                )
+                _capture_eq_solving_result(id_command, session)
+                _capture_shots_result(id_command, session)
+                id_command["count_info"] = state.requested_count_tele if state.requested_count_tele else state.requested_count_wide
+                id_command["mosaic_info"] =  program.get("setup_camera", {}).get("doMosaic") and program.get("setup_camera", {}).get("do_action")
+                if not id_command["mosaic_info"]:
+                    id_command["message"] += _early_stop_note(id_command, session, program)
             state.shots_taken = id_command.get("shots_taken")
             state.shots_stacked = id_command.get("shots_stacked")
             state.exposure_actual = id_command.get("exposure_actual") or ""
@@ -1041,7 +1584,7 @@ def _run_blocking(
             if current_path is not None:
                 dirs = session_dirs_for(session)
                 starting_date = id_command.get(
-                    "starting_date", datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    "starting_date", session_now(session).strftime("%Y-%m-%d %H:%M:%S")
                 )
                 dt_str = starting_date.replace(":", "-").replace(" ", "-")
                 new_filename_base = re.sub(
@@ -1051,7 +1594,7 @@ def _run_blocking(
                 done_path = os.path.join(dirs["DONE_DIR"], new_filename)
                 os.makedirs(dirs["DONE_DIR"], exist_ok=True)
 
-                _update_process_status(full_program, "done")
+                _update_process_status(full_program, "done", session=session)
                 _write_json(done_path, full_program)
                 if os.path.exists(current_path):
                     os.remove(current_path)
@@ -1078,12 +1621,16 @@ def _run_blocking(
                 dirs = session_dirs_for(session)
                 error_path = os.path.join(dirs["ERROR_DIR"], os.path.basename(current_path))
                 os.makedirs(dirs["ERROR_DIR"], exist_ok=True)
-                _update_process_status(full_program, "done")
+                _update_process_status(full_program, "done", session=session)
                 _write_json(error_path, full_program)
                 if os.path.exists(current_path):
                     os.remove(current_path)
                 state.last_saved_path = error_path
     finally:
+        # Its end-of-session settings for what follows (components/end_of_night.py),
+        # before the run is seen as over
+        from components import end_of_night
+        end_of_night.program_ended(session.dwarf_uid, id_command, bool(state.stop_requested))
         state.running = False
         #clear_run(session.dwarf_uid)
         connection_health.release_command_slot(session.dwarf_uid)
@@ -1109,6 +1656,14 @@ def start_run(
 
     if is_running(dwarf_uid):
         raise RuntimeError("A program is already running for this device.")
+    from components import device_lock  # local import, as connection_health's
+    if not device_lock.claim(dwarf_uid):
+        raise RuntimeError("This Dwarf is used by another Astro Dwarf Session instance on this PC.")
+    from components import connection_health
+    if connection_health.wrong_dwarf(dwarf_uid):
+        # Another Dwarf answers at its IP (last check, no network here): the
+        # program would run on that one
+        raise RuntimeError(connection_health.wrong_dwarf_text(session))
 
     # Marked here, BEFORE the background thread even starts (user-
     # reported Sep 2026: a real overnight log showed a scheduled

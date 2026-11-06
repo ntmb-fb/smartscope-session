@@ -26,6 +26,7 @@ been successfully paired (dwarf_uid confirmed).
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable
@@ -77,6 +78,45 @@ def add_device_entry(name: str, config_py: str, config_ini: str) -> DeviceEntry:
     return entry
 
 
+def _same_file(a: str, b: str) -> bool:
+    return os.path.normcase(os.path.abspath(a or "")) == os.path.normcase(os.path.abspath(b or ""))
+
+
+def entry_for(config) -> DeviceEntry | None:
+    """The devices.json entry of a loaded Dwarf (its DwarfConfig), by its
+    config.py - the natural key, see remove_device_entry()."""
+    path = getattr(config, "config_py_path", "") or ""
+    return next((e for e in _read_entries() if _same_file(e.config_py, path)), None)
+
+
+def device_name(session) -> str:
+    """The name given to the Dwarf when it was added (user-reported Oct
+    2026: typed at pairing / manual configuration, then shown nowhere -
+    every page showed its dwarf_uid), else its dwarf_uid."""
+    entry = entry_for(session.config)
+    return (entry.name.strip() if entry and entry.name else "") or session.dwarf_uid
+
+
+def name_and_uid(session) -> str:
+    """"Name (dwarf_uid)", or the dwarf_uid alone when it has no name."""
+    name = device_name(session)
+    return name if name == session.dwarf_uid else f"{name} ({session.dwarf_uid})"
+
+
+def rename_device(session, name: str) -> bool:
+    """Its display name only: the dwarf_uid and the config files stay, so
+    programs, the Scope Archive link and the Hub are untouched. False when
+    the Dwarf has no devices.json entry."""
+    entries = _read_entries()
+    path = getattr(session.config, "config_py_path", "") or ""
+    for e in entries:
+        if _same_file(e.config_py, path):
+            e.name = name.strip()
+            _write_entries(entries)
+            return True
+    return False
+
+
 def remove_device_entry(config_py: str) -> None:
     """Removes an entry by its config.py path (natural key: one file
     pair corresponds to exactly one physical device)."""
@@ -84,21 +124,58 @@ def remove_device_entry(config_py: str) -> None:
     _write_entries(entries)
 
 
+# Why a devices.json entry wasn't loaded at startup (user-reported Oct
+# 2026: after a reinstall, 2 Dwarfs shown out of 3, nothing said why) -
+# logged, and shown on the dashboard
+BOOT_PROBLEMS: list[str] = []
+
+
 def bootstrap_devices(manager: DwarfManager) -> None:
     """Registers one DwarfSession per known entry in devices.json. An
-    entry whose files are missing, or without a usable dwarf_uid, is
-    silently skipped rather than crashing startup - the device can
-    always be re-paired later via pages/pairing.py."""
+    entry whose files are missing, without a usable dwarf_uid, or with
+    the dwarf_uid of an entry already loaded (two entries of one Dwarf:
+    the second would replace the first) is skipped rather than crashing
+    startup - and said in BOOT_PROBLEMS. The device can always be
+    re-paired later via pages/pairing.py."""
+    import dwarf_python_api.lib.my_logger as log
+
+    BOOT_PROBLEMS.clear()
+    loaded: dict[str, str] = {}
+    ips: dict[str, str] = {}
     for entry in _read_entries():
+        label = entry.name or entry.config_py
+        if not os.path.isfile(entry.config_py):
+            BOOT_PROBLEMS.append(f"{label}: {os.path.abspath(entry.config_py)} not found")
+            continue
         try:
             cfg = DwarfConfig.from_files(entry.config_py, entry.config_ini)
         except FileNotFoundError:
+            BOOT_PROBLEMS.append(f"{label}: {entry.config_ini} not found")
+            continue
+        except Exception as e:   # an unreadable file: the others still loaded
+            BOOT_PROBLEMS.append(f"{label}: {entry.config_py} unreadable ({e})")
             continue
 
         if not cfg.dwarf_uid:
+            BOOT_PROBLEMS.append(f"{label}: no dwarf_uid in {entry.config_py}")
+            continue
+        if cfg.dwarf_uid in loaded:
+            BOOT_PROBLEMS.append(f"{label}: same dwarf_uid ({cfg.dwarf_uid}) as {loaded[cfg.dwarf_uid]} "
+                                 f"in {entry.config_py} - only the first is shown")
             continue
 
         manager.add(cfg)
+        loaded[cfg.dwarf_uid] = label
+        # Two Dwarfs at one IP: connecting one reaches the other (user-
+        # reported Oct 2026) - both loaded, said
+        ip = (cfg.dwarf_ip or "").strip()
+        if ip and ip in ips:
+            BOOT_PROBLEMS.append(f"{label}: same IP ({ip}) as {ips[ip]} - one of them has an old IP, "
+                                 "update it in its Settings")
+        elif ip:
+            ips[ip] = label
+    for problem in BOOT_PROBLEMS:
+        log.warning(f"devices.json - {problem}")
 
 
 def find_shared_config_value(manager: DwarfManager, getter, exclude_uid: str = ""):

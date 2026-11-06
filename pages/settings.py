@@ -53,14 +53,17 @@ from dwarf_python_api.get_config_data import set_config_data
 from dwarf_python_api.lib.dwarf_config import DwarfConfig
 from dwarf_python_api.lib.dwarf_session import get_manager
 
-from device_registry import find_shared_config_value
+from device_registry import find_shared_config_value, name_and_uid, rename_device, device_name
 from device_provisioning import update_dwarf_ip
 from dwarf_python_api.lib.dwarf_utils import perform_disconnect
 
+from components import scope_archive
 from components import connection_health
 from components.ble_pairing import connect_ble, scan_dwarf_devices, write_ble_credentials
 from components.geolocation import fetch_current_location
+from components.https_card import render_https_card
 from components.i18n import t
+from components.network_info import qr_svg, wake_url
 from components.pwa import add_pwa_head_tags
 from components.site_picker import site_picker
 from components.theme import apply_theme
@@ -109,17 +112,38 @@ def _do_force_bluetooth(
         lock_file=config_py + ".lock",
     )
 
+    # connect_ble() writes what it found (uid, IP, model) into config_py
+    # as it goes: kept as it was unless it is this Dwarf (user-reported Oct
+    # 2026: another Dwarf answered, "not applied" was said, but its uid was
+    # in the file already - after a restart this Dwarf had the other one's
+    # identity, and one of the two vanished from the list)
+    try:
+        with open(config_py, "rb") as f:
+            saved = f.read()
+    except OSError:
+        saved = None
+
+    def _restore() -> None:
+        if saved is not None:
+            try:
+                with open(config_py, "wb") as f:
+                    f.write(saved)
+            except OSError:
+                pass
+
     connected = connect_ble(ble_psd, wifi_ssid, wifi_pwd, auto_select)
     if not connected:
+        _restore()
         return False, t("settings_force_ble_failed")
 
     fresh = DwarfConfig.from_files(config_py, config_ini)
     if not fresh.dwarf_uid:
+        _restore()
         return False, t("settings_force_ble_no_uid")
     if fresh.dwarf_uid != session.dwarf_uid:
-        # Shouldn't normally happen for the SAME physical device, but if
-        # BLE somehow matched a DIFFERENT Dwarf, don't silently merge
-        # its identity into this session.
+        # BLE matched a DIFFERENT Dwarf (several in range): its identity
+        # neither in this session nor in this Dwarf's file
+        _restore()
         return False, t(
             "settings_force_ble_uid_mismatch", expected=session.dwarf_uid, got=fresh.dwarf_uid
         )
@@ -153,7 +177,29 @@ def build_settings_page() -> None:
             # which device these settings actually apply to - would
             # otherwise be invisible.
             ui.label(t("settings_title")).classes("text-xl")
-            ui.label(session.dwarf_uid).classes("text-sm text-grey-6 -mt-2")
+            name_label = ui.label(name_and_uid(session)).classes("text-sm text-grey-6 -mt-2")
+
+            # The Dwarf's name (user-reported Oct 2026: typed when it was
+            # added, then neither shown nor editable) - its display name
+            # only, the dwarf_uid and the config files stay
+            def _handle_rename() -> None:
+                new_name = (name_input.value or "").strip()
+                if not new_name:
+                    ui.notify(t("settings_device_name_required"), type="negative")
+                    return
+                if not rename_device(session, new_name):
+                    ui.notify(t("settings_device_name_failed"), type="negative")
+                    return
+                name_label.set_text(name_and_uid(session))
+                ui.notify(t("settings_device_name_saved", name=new_name), type="positive")
+
+            with ui.row().classes("w-full items-center gap-2 no-wrap"):
+                name_input = ui.input(
+                    t("settings_device_name"),
+                    value="" if device_name(session) == session.dwarf_uid else device_name(session),
+                ).classes("flex-1").on("keydown.enter", _handle_rename)
+                ui.button(icon="save", on_click=_handle_rename).props("flat round") \
+                    .tooltip(t("settings_device_name_save"))
             ui.label(t("settings_location_hint")).classes("text-sm text-grey-6")
 
             geolocation_status = ui.label("").classes("text-xs")
@@ -275,11 +321,11 @@ def build_settings_page() -> None:
             # declare the field.
             ui.label(t("settings_dwarfium_hint")).classes("text-sm text-grey-6 mt-2")
             with ui.row().classes("w-full gap-2"):
+                _scope_url, _dwarfium_id_current = scope_archive.scope_settings(session.config)
                 dwarfium_url_input = ui.input(
                     t("settings_dwarfium_url"),
-                    value=getattr(session.config, "dwarfium_base_url", "") or "http://localhost:8080",
+                    value=_scope_url or "http://localhost:8080",
                 ).classes("flex-1")
-                _dwarfium_id_current = getattr(session.config, "dwarfium_id", "")
                 dwarfium_id_input = ui.number(
                     t("settings_dwarfium_id"),
                     value=int(_dwarfium_id_current) if _dwarfium_id_current else None,
@@ -420,16 +466,26 @@ def build_settings_page() -> None:
                         ble_status_label.set_text(t("pairing_connection_failed"))
                         return
 
-                    if outcome == "single":
-                        await _finish_force_ble("")
+                    # This Dwarf by its Bluetooth name, which is its dwarf_uid
+                    # (user-reported Oct 2026: Force Bluetooth done with the
+                    # other DWARF 3, which then got this one's place) - straight
+                    # to it when found, never another one on its own
+                    if dwarf_uid in names:
+                        await _finish_force_ble(dwarf_uid)
                         return
-
-                    ble_status_label.set_text(t("pairing_multiple_found", count=len(names)))
+                    if outcome == "single":
+                        ble_status_label.set_text(t("settings_force_ble_other_found", name=dwarf_uid, found=names[0]))
+                    else:
+                        ble_status_label.set_text(t("pairing_multiple_found", count=len(names)) + " "
+                                                  + t("settings_force_ble_not_listed", name=dwarf_uid))
+                    ble_status_label.classes(replace="text-xs text-orange-800")
                     with ble_choice_container:
-                        ble_choice = ui.radio(names, value=names[0]).classes("w-full")
+                        ble_choice = ui.radio(names, value=None).classes("w-full")
                         ui.label(t("pairing_rescan_note")).classes("text-xs text-grey-5")
 
                         async def _connect_chosen() -> None:
+                            if not ble_choice.value:
+                                return
                             ble_choice_container.clear()
                             await _finish_force_ble(ble_choice.value)
 
@@ -439,6 +495,18 @@ def build_settings_page() -> None:
                     force_ble_button.enable()
 
                 force_ble_button.on("click", _handle_force_ble)
+
+            # Wake up from the phone (user-requested Oct 2026): a Dwarf
+            # that no longer answers on the home Wi-Fi wakes up once
+            # switched to its hotspot over Bluetooth - from the phone's
+            # browser (/wake-dwarf, wake_dwarf.html) when this PC is too
+            # far from the Dwarf for Force Bluetooth above.
+            with ui.card().classes("w-full p-0 mt-2"), ui.expansion(t("settings_wake_title"), icon="wifi_tethering", value=False).classes("w-full"):
+                ui.label(t("settings_wake_hint")).classes("text-xs text-grey-6")
+                url = wake_url(dwarf_uid)
+                ui.html(qr_svg(url)).classes("w-48 h-48")
+                ui.link(url, url, new_tab=True).classes("text-xs break-all")
+                ui.label(t("settings_wake_chrome")).classes("text-xs text-grey-6")
 
             # Manual IP update (user-requested Sep 2026) - for someone
             # who configured this device manually in the first place
@@ -474,3 +542,8 @@ def build_settings_page() -> None:
                     manual_ip_status.classes(replace="text-xs text-green-700")
 
                 ui.button(t("settings_manual_ip_button"), icon="save", on_click=_handle_manual_ip_update)
+
+            # HTTPS for phones (user-requested Oct 2026), the last card:
+            # Android installs the app full screen only over HTTPS - see
+            # components/https_server.py
+            render_https_card()

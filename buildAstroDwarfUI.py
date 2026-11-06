@@ -19,6 +19,8 @@ import os
 import re
 import shutil
 import subprocess
+import sys
+import importlib.util
 import zipfile
 from pathlib import Path
 
@@ -37,16 +39,9 @@ DIST_LOCALES_DIR = DIST_DIR / "components" / "locales"
 # import-tracing doesn't pick up, unlike the .py modules around it.
 _ble_connect_html = Path("dwarf_ble_connect") / "connect_dwarf.html"
 
-# catalog.html - the external DSO target-catalog page (components/
-# api_routes.py's /catalog route). MUST be bundled via --add-data, not
-# just copied loose into dist/ (user-reported Sep 2026: copying it next
-# to the built .exe did NOT work) - in a --onefile build, __file__ for
-# a bundled module resolves inside the PyInstaller extraction temp dir
-# (sys._MEIPASS), never the folder the .exe itself lives in, so a loose
-# file next to the .exe was never where the lookup was actually
-# checking. Destination "." bundles it at the ROOT of that extraction
-# dir, matching _bundled_path()'s own sys._MEIPASS / "catalog.html".
-_catalog_html = Path("catalog.html")
+# catalog.html - external DSO catalog page (external project): NOT bundled, copied
+# as a loose file into dist/assets/ (step 3) and read via _external_path().
+_catalog_html = Path("assets") / "catalog.html"
 
 # program_fr.html / program_en.html - the combined "local programs +
 # native on-device schedule" page, one file per language (components/
@@ -57,8 +52,6 @@ _catalog_html = Path("catalog.html")
 # root of the PyInstaller extraction dir) - a loose copy next to the
 # built .exe would NOT be found, for the same reason catalog.html's
 # own note above explains.
-_program_htmls = [Path("program_fr.html"), Path("program_en.html")]
-
 sep = os.pathsep  # Cross-platform separator: ; on Windows, : on Unix/macOS
 
 extra_data = []
@@ -67,16 +60,29 @@ if _ble_connect_html.exists():
 else:
     print(f"Warning: {_ble_connect_html} not found - BLE pairing may break in the built exe.")
 
-if _catalog_html.exists():
-    extra_data.append(f"{_catalog_html}{sep}.")
-else:
-    print(f"Warning: {_catalog_html} not found - the target-catalog page will be unavailable in the built exe.")
+# Project HTML pages: bundled in the exe (rebuild needed to change them).
+_project_htmls = [
+    Path(f"{page}_{lang}.html")
+    for page in ("program", "milky_way_mosaic_planner")
+    for lang in ("fr", "en")
+]
 
-for _program_html in _program_htmls:
-    if _program_html.exists():
-        extra_data.append(f"{_program_html}{sep}.")
+# Single-file pages (texts in both languages inside)
+_project_htmls.append(Path("plan_target.html"))
+_project_htmls.append(Path("wake_dwarf.html"))
+
+for _html in _project_htmls:
+    if _html.exists():
+        extra_data.append(f"{_html}{sep}.")
     else:
-        print(f"Warning: {_program_html} not found - /Program-{_program_html.stem.rsplit('_', 1)[-1]} will be unavailable in the built exe.")
+        print(f"Warning: {_html} not found - its page will be unavailable in the built exe.")
+
+# js/ is mounted by app.mount("/js") from _bundled_path("") / "js"
+# (app.js, dwarf-scheduler.js, renderMosaic_dwarf.js, ...)
+if Path("js").is_dir():
+    extra_data.append(f"js{sep}js")
+else:
+    print("Warning: js/ not found - the /js static mount will be skipped in the built exe.")
 
 print("Current working directory:", os.getcwd())
 
@@ -104,24 +110,64 @@ with open("version.py", "w", encoding="utf-8") as f:
     f.write(f'APP_VERSION = "{version_str}"\n')
 print(f"Version extracted: {version_str}")
 
-# Step 2 - Run nicegui-pack
+# Step 2 - Run PyInstaller (nicegui-pack's arguments)
 print("Building executable...")
 
 if not Path(ICON_NAME).exists():
     print(f"Warning: {ICON_NAME} not found - building without a custom icon.")
 
+# Every requirement importable by THIS Python, the one PyInstaller runs in
+# below (user-reported Oct 2026: the rebuilt exe failed with "No module
+# named 'qrcode'" while the app ran fine from Python - PyInstaller leaves
+# out, silently, a module its own interpreter can't find).
+_IMPORT_NAMES = {"protobuf": "google.protobuf", "filelock": "filelock", "pywebview": "webview"}
+missing = []
+for line in Path("requirements.txt").read_text(encoding="utf-8").splitlines():
+    name = re.split(r"[<>=~!\[; ]", line.strip(), maxsplit=1)[0]
+    if not name or name.startswith("#"):
+        continue
+    module = _IMPORT_NAMES.get(name.lower(), name.lower())
+    try:
+        found = importlib.util.find_spec(module) is not None
+    except ModuleNotFoundError:
+        found = False
+    if not found:
+        missing.append(name)
+if importlib.util.find_spec("PyInstaller") is None:
+    missing.append("pyinstaller")
+# macOS: PyInstaller turns the .ico into an .icns with Pillow (the CI
+# workflow installs it for that, build.yml - a build by hand needs it too)
+if sys.platform == "darwin" and Path(ICON_NAME).exists() and importlib.util.find_spec("PIL") is None:
+    missing.append("Pillow")
+if missing:
+    extras = [m for m in missing if m in ("pyinstaller", "Pillow")]   # not in requirements.txt
+    raise SystemExit(
+        f"Not installed for {sys.executable}: {', '.join(missing)}\n"
+        f"Run: \"{sys.executable}\" -m pip install -r requirements.txt {' '.join(extras)}".rstrip()
+    )
+
+import nicegui  # noqa: E402 - checked just above
+
 icon_args = ["--icon", ICON_NAME] if Path(ICON_NAME).exists() else []
+# PyInstaller run by this very Python (what nicegui-pack does on Linux /
+# macOS; on Windows it calls the first "pyinstaller" on the PATH, which can
+# belong to another Python install) - same arguments as nicegui-pack.
 pack_cmd = [
-    "nicegui-pack",
-    "--onefile",
-    "--windowed",
-    *icon_args,
+    sys.executable, "-m", "PyInstaller",
     "--name", APP_NAME,
+    "--noconfirm",
+    "--windowed",
+    "--onefile",
+    *icon_args,
+    "--add-data", f"{Path(nicegui.__file__).parent}{sep}nicegui",
     "--add-data", f"{IMAGES_DIR}{sep}images",
     *[arg for data in extra_data for arg in ["--add-data", data]],
+    # imported inside a function (components/network_info.py)
+    "--hidden-import", "qrcode", "--hidden-import", "qrcode.image.svg",
     SOURCE_FILE,
 ]
 
+print("PyInstaller command:", " ".join(pack_cmd))
 subprocess.run(pack_cmd, check=True)
 
 # Step 3 - Copy additional files into dist
@@ -155,14 +201,37 @@ for locale_file in Path("components/locales").glob("*.py"):
 # faire deux version pour l'instant _fr _en" - no real i18n system in
 # this standalone file yet). /mosaic-planner-{lang} (components/
 # api_routes.py) looks for both by this exact naming.
-for _lang in ("fr", "en"):
-    _lang_html = Path(f"milky_way_mosaic_planner_{_lang}.html")
-    if _lang_html.exists():
-        dest = DIST_DIR / _lang_html.name
-        print(f"Copying {_lang_html} to {dest}")
-        shutil.copy2(_lang_html, dest)
-    else:
-        print(f"Warning: {_lang_html} not found - /mosaic-planner-{_lang} will be unavailable until one is placed next to the built exe.")
+# Project HTML pages: bundled in the exe (rebuild needed to change them).
+
+# catalog.html comes from an external project: loose file in assets/ next to the exe,
+# replaceable without a rebuild (read through _external_path()).
+DIST_ASSETS_DIR = DIST_DIR / "assets"
+DIST_ASSETS_DIR.mkdir(parents=True, exist_ok=True)
+if _catalog_html.exists():
+    print(f"Copying {_catalog_html} to {DIST_ASSETS_DIR / _catalog_html.name}")
+    shutil.copy2(_catalog_html, DIST_ASSETS_DIR / _catalog_html.name)
+else:
+    print("Warning: catalog.html not found - /catalog will be unavailable until placed in assets/ next to the built exe.")
+
+# dso_catalog.json: Dwarfium Scope Archive's DSO catalog (program editor's
+# "Pick from catalog") - same loose-file treatment, so a newer copy from
+# that project can be dropped in without a rebuild (components/dso_catalog.py).
+_dso_catalog = Path("assets") / "dso_catalog.json"
+if _dso_catalog.exists():
+    print(f"Copying {_dso_catalog} to {DIST_ASSETS_DIR / _dso_catalog.name}")
+    shutil.copy2(_dso_catalog, DIST_ASSETS_DIR / _dso_catalog.name)
+else:
+    print("Warning: dso_catalog.json not found - 'Pick from catalog' will be unavailable unless Dwarfium Scope Archive is installed next to the exe.")
+
+# eclipsing_binaries_seed.json: the seed stars' elements (program editor's
+# eclipsing binary minima, components/eclipsing_binaries.py) - loose file too.
+_eb_seed = Path("assets") / "eclipsing_binaries_seed.json"
+if _eb_seed.exists():
+    print(f"Copying {_eb_seed} to {DIST_ASSETS_DIR / _eb_seed.name}")
+    shutil.copy2(_eb_seed, DIST_ASSETS_DIR / _eb_seed.name)
+else:
+    print("Warning: eclipsing_binaries_seed.json not found - the seed stars' elements will be fetched from VSX on first use.")
+
 
 # Step 4 - Zip everything in dist
 suffix = os.environ.get("RUNNER_OS", "unknown")  # Windows, Linux, macOS

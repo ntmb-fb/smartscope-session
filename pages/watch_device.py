@@ -8,8 +8,9 @@ no code path here that could ever send a command to the device, regardless
 of future edits.
 
 Reused as-is from the control app, both already read-only by construction:
-- components.camera_stream.build_camera_stream_section(session): pseudo-live
-  HTTP preview + embedded RTSP worker, no capture controls.
+- components.live_view.build_stacked_preview(session): the stacked image
+  (not the stream, user-asked Oct 2026), as adjusted from the control app;
+  a click opens the full-screen view (/watch/<uid>/live), display only.
 - dwarf_python_api.lib.dwarf_session_socket.get_client_status(session): the
   same status cache pages/session.py reads for battery/temperature/storage,
   here also read for the capture counters - takePhotoCount/takeWidePhotoCount
@@ -38,22 +39,28 @@ device's data into another's page.
 """
 from __future__ import annotations
 
-from nicegui import ui
+import time
+
+from nicegui import background_tasks, run, ui
 
 from dwarf_python_api.lib.dwarf_session import get_manager
 from dwarf_python_api.lib.dwarf_session_socket import get_client_status
 from dwarf_python_api.lib.dwarf_utils import perform_read_camera_params_http_v3
 
-from components.camera_stream import build_camera_stream_section
+from components.live_view import build_stacked_preview
 from components.camera_settings import ir_filter_display_label
-from components import scheduler_runner
+from components import current_activity, device_task, scheduler_runner
 from dwarf_python_api.get_config_data import config_to_dwarf_id_str
 from components.i18n import t
 from components.pwa import add_pwa_head_tags
 from components.theme import apply_theme, theme_toggle_button
+from components.status_banner import status_banner
+from device_registry import device_name
 from dwarf_session import _ir_filter_display_name
 
 _POLL_INTERVAL_S = 2.0
+# The camera's settings read over HTTP at most this often (_http_params)
+_HTTP_EVERY_S = 30
 
 
 def _metric(
@@ -90,6 +97,58 @@ def _metric(
                 ui.label(str(stacked_value)).classes("text-3xl font-semibold")
 
 
+def _first_nonzero(*vals):
+    """First truthy value, else the first one (keeps a plain 0 / None as is)."""
+    for v in vals:
+        if v:
+            return v
+    return vals[0]
+
+
+def _capture_kind(full_status: dict) -> str | None:
+    """i18n key describing what is being captured, or None if nothing is."""
+    if not (
+        full_status.get("AstroCapture")
+        or full_status.get("takePhotoStarted")
+        or full_status.get("takeWidePhotoStarted")
+    ):
+        return None
+    # takeMosaicCount = global number of images taken during a mosaic.
+    # (0 before the very first frame -> "Astro capture" until then.)
+    if full_status.get("takeMosaicCount"):
+        return "watch_capture_mosaic"
+    if full_status.get("takeWidePhotoStarted") and not full_status.get("takePhotoStarted"):
+        return "watch_capture_wide"
+    return "watch_capture_astro"
+ 
+ 
+def _activity_banner(text: str, detail: str = "") -> None:
+    """Text + small spinner, readable in light and dark theme. Display only.
+    detail: optional second line (current target, schedule task)."""
+    with ui.row().classes("items-center gap-2 w-full px-3 py-2 rounded-borders no-wrap").style(
+        "background: rgba(25, 118, 210, 0.15)"
+    ):
+        ui.spinner(size="sm").classes("shrink-0")
+        with ui.column().classes("gap-0 min-w-0"):
+            ui.label(text).classes("text-sm font-medium")
+            if detail:
+                ui.label(detail).classes("text-xs opacity-80")
+
+
+def _activity_detail(session, activity: dict | None) -> str:
+    """Second banner line: the program's target, or "Schedule · task
+    (2/3, 21:05-22:30)" for a native schedule task - see
+    components/current_activity.py (cache read only, no command sent)."""
+    if not activity or not activity["target"]:
+        return ""
+    if activity["source"] != "schedule":
+        return t("watch_target", target=activity["target"])
+    text = t("card_schedule_target", schedule=activity["title"], target=activity["target"])
+    window = current_activity.format_window(session, activity["start"], activity["end"])
+    task = t("card_schedule_task", index=activity["index"], total=activity["total"])
+    return f"{text} ({task}{', ' + window if window else ''})"
+ 
+
 def build_watch_device_page() -> None:
     @ui.page("/watch/{dwarf_uid}", title="Astro Dwarf Session — Watch")
     def watch_device_page(dwarf_uid: str) -> None:
@@ -111,8 +170,11 @@ def build_watch_device_page() -> None:
                 ui.label(t("device_not_found")).classes("text-negative")
                 return
 
-            ui.label(dwarf_uid).classes("text-xl font-medium")
-            ui.label(session.config.dwarf_ip or t("unknown_ip")).classes(
+            name = device_name(session)
+            ui.label(name).classes("text-xl font-medium")
+            ui.label(" · ".join(x for x in (
+                dwarf_uid if name != dwarf_uid else "",
+                session.config.dwarf_ip or t("unknown_ip")) if x)).classes(
                 "text-xs text-grey-6"
             )
 
@@ -121,6 +183,8 @@ def build_watch_device_page() -> None:
                 connected_icon = ui.icon("circle").classes("text-xs")
                 connected_label = ui.label("")
 
+            banner_col = ui.column().classes("w-full")
+
             if session.is_connected:
                 # Camera preview + RTSP embed: reused verbatim, no
                 # capture controls of any kind inside it. show_links=
@@ -128,7 +192,11 @@ def build_watch_device_page() -> None:
                 # block below the preview is for opening the stream in
                 # an external player from the control app, not useful
                 # to a read-only spectator here.
-                build_camera_stream_section(session, show_links=False)
+                #
+                # The stacked image, not the stream (user-asked Oct 2026,
+                # issue #164), as adjusted from the control app - a click
+                # opens the full-screen view with the session's info
+                build_stacked_preview(session, f"/watch/{dwarf_uid}/live")
 
             # ui.grid(), not ui.row() (user-reported Sep 2026: cards
             # still weren't matching heights within a row despite
@@ -151,6 +219,28 @@ def build_watch_device_page() -> None:
                 gain_metric = ui.column()
                 filter_metric = ui.column()
 
+            # The camera's exposure / gain / filter from the Dwarf's HTTP API:
+            # read in the background at most every _HTTP_EVERY_S, the last
+            # answer shown meanwhile - read here on each 2 s refresh, its
+            # 5 s timeout froze the whole app while the Dwarf was busy (user-
+            # reported Nov 2026: a megastack, the app hardly answering). Not
+            # read during a megastack (no camera settings then).
+            http_cache = {"at": 0.0, "params": False, "busy": False}
+
+            def _http_params():
+                if (not http_cache["busy"] and time.monotonic() - http_cache["at"] >= _HTTP_EVERY_S
+                        and not device_task.megastack_running(session)):
+                    http_cache["busy"] = True
+
+                    async def _read() -> None:
+                        try:
+                            http_cache["params"] = await run.io_bound(
+                                perform_read_camera_params_http_v3, mode_id=2, session=session)
+                        finally:
+                            http_cache["at"], http_cache["busy"] = time.monotonic(), False
+                    background_tasks.create(_read(), name=f"watch-http-params-{dwarf_uid}")
+                return http_cache["params"]
+
             def _refresh() -> None:
                 connected_icon.classes(
                     replace="text-xs " + ("text-positive" if session.is_connected else "text-grey-5")
@@ -159,6 +249,7 @@ def build_watch_device_page() -> None:
 
                 if not session.is_connected:
                     for col in (
+                        banner_col,
                         battery_metric, temperature_metric,
                         tele_count_metric, wide_count_metric,
                         exposure_metric, gain_metric, filter_metric,
@@ -183,11 +274,15 @@ def build_watch_device_page() -> None:
                 # under a misleading name, i.e. "captured so far", not the
                 # target - same mix-up fixed on the dashboard card
                 # (components/device_card.py).
-                tele_current = full_status.get("takePhotoCount")
-                tele_stacked = full_status.get("takePhotoStacked")
+                tele_current = _first_nonzero(
+                    full_status.get("takePhotoCount"), full_status.get("takeMosaicCount")
+                )
+                tele_stacked = _first_nonzero(
+                    full_status.get("takePhotoStacked"), full_status.get("takeMosaicStacked")
+                )
                 wide_current = full_status.get("takeWidePhotoCount")
                 wide_stacked = full_status.get("takeWidePhotoStacked")
-
+ 
                 run_state = scheduler_runner.get_run_state(dwarf_uid)
                 # Two SEPARATE totals now (user-reported Sep 2026: a
                 # single shared total wrongly showed "0/20" on Wide when
@@ -198,6 +293,37 @@ def build_watch_device_page() -> None:
                 tele_total = (run_state.requested_count_tele if run_state else "") or ""
                 wide_total = (run_state.requested_count_wide if run_state else "") or ""
 
+                # A megastack (this app's or another's): its progress in
+                # the banner and the Tele card, its stack in the Tele frame
+                # (camera_stream) - as on the device page and the card
+                megastack_on = device_task.megastack_running(session)
+                megastack_counts = device_task.megastack_counts(session) if megastack_on else None
+                if megastack_counts:
+                    tele_stacked, tele_current, total = megastack_counts
+                    tele_total = str(total) if total else ""
+
+                error = full_status.get("ErrorConnection")
+                capture_key = _capture_kind(full_status)
+                activity = current_activity.current_activity(session, full_status)
+                banner_col.clear()
+                with banner_col:
+                    if error:
+                        status_banner(t("error_with_detail", error=error), kind="danger")
+                    elif megastack_on:
+                        _activity_banner(
+                            device_task.megastack_progress_text(megastack_counts) if megastack_counts
+                            else t("device_task_megastack"),
+                            _activity_detail(session, activity),
+                        )
+                    elif capture_key:
+                        _activity_banner(t(capture_key), _activity_detail(session, activity))
+                    elif scheduler_runner.is_running(dwarf_uid):
+                        # goto / calibration / camera-setup phases, before capturing starts
+                        _activity_banner(t("program_running_banner"), _activity_detail(session, activity))
+                    elif activity:
+                        # Native schedule task window, before its capture starts
+                        _activity_banner(t("watch_schedule_running"), _activity_detail(session, activity))
+  
                 tele_count_metric.clear()
                 with tele_count_metric:
                     _metric(
@@ -270,11 +396,7 @@ def build_watch_device_page() -> None:
                             run_state.ir_filter_actual if run_state else None,
                             value_classes="text-lg font-medium",
                         )
-                http_params = (
-                    perform_read_camera_params_http_v3(mode_id=2, session=session)
-                    if not skip_http_poll
-                    else False
-                )
+                http_params = _http_params() if not skip_http_poll else False
                 # Which camera's params to actually read (user-reported
                 # Sep 2026: this used to always read cameras[0] - Tele -
                 # even during a Wide-only capture, so exposure/gain
