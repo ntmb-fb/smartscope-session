@@ -65,13 +65,7 @@ jobs:
 
       - name: Report conflict
         if: steps.merge.outputs.conflict == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}   # in a fork, gh would otherwise target upstream
+        # Issues are disabled on this fork: the failed run (and its email) is the alert.
         run: |
-          title="Upstream sync needs a manual merge"
-          gh issue list --state open --search "$title in:title" --json number --jq '.[0].number' | grep -q . && exit 0
-          gh issue create --title "$title" --body "Conflicting files:
-          $(cat conflicts.txt)
-
-          Run \`tools/sync-upstream.sh\` locally to resolve."
+          echo "::error::Upstream merge conflict in: $(tr '\n' ' ' < conflicts.txt). Run tools/sync-upstream.sh locally to resolve."
+          exit 1

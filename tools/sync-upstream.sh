@@ -42,7 +42,7 @@ if [[ "$new" == 0 ]]; then
   echo "Already up to date with upstream/$UPSTREAM_BRANCH."
 else
   echo "Merging $new new upstream commit(s):"
-  git log --oneline --no-decorate "HEAD..upstream/$UPSTREAM_BRANCH" | head -20
+  git log --oneline --no-decorate -20 "HEAD..upstream/$UPSTREAM_BRANCH"
   if ! git merge --no-edit "upstream/$UPSTREAM_BRANCH"; then
     echo
     echo "Merge conflict. Our code only touches upstream files at lines marked"
