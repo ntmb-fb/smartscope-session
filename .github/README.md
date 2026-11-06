@@ -79,7 +79,7 @@ docker compose -f docker/docker-compose.yml up -d --build
 - **Data:** all app data (telescopes, Sites, program queues, logs, HTTPS certificates) lives in `docker/data/`. Back it up, and keep it when updating.
 - **Updating:** replace the code (or `git pull`), then in Container Manager open the project → **Action** → **Build**. Your data folder is untouched.
 - **Host networking:** the container uses the NAS's own network (`network_mode: host`), so the app knows its real LAN address for the Watch QR code and HTTPS. It also reaches your telescopes directly.
-- **Ports:** web UI on **8765**. Change with `PORT` if something else uses it; HTTPS for phones is on 8443 (`SMARTSCOPE_HTTPS_PORT`). If the NAS firewall is on, allow them.
+- **Ports:** web UI on **8765**. Change with `PORT` if something else uses it; HTTPS for phones is on 8443 (`ASTRO_DWARF_HTTPS_PORT`). If the NAS firewall is on, allow them.
 - **Pairing a Dwarf:** Bluetooth pairing isn't available in a container. Use the **Wi-Fi icon** (manual setup) with the IP and UID shown in the DwarfLab app.
 - **Seestar key:** put your `.pem` file in `docker/data/` and enter `/data/<file>.pem` as its path in the telescope's settings.
 - **Desktop window:** the container runs as a server only; there's no desktop window. Use a browser, or install the app on your phone (HTTPS for phones).
@@ -162,16 +162,16 @@ TonightPlan has no official data feed. The app reads the catalog from the site's
 
 ## HTTPS for phones
 
-Android Chrome only installs web apps full-screen over HTTPS. On the dashboard, tap the **🔒** icon next to *Other smart telescopes*, then **Enable HTTPS**. The page shows two QR codes:
+Android Chrome only installs web apps full-screen over HTTPS. This uses upstream's HTTPS feature (it started as this fork's). Open it from the **🔒** icon next to *Other smart telescopes*, or from any Dwarf's settings, and turn it on. It shows two QR codes:
 
 1. **Download the certificate** to your phone and install it once:
    - **Android:** *Settings → Security & privacy → More security settings → Encryption & credentials → Install a certificate → CA certificate*.
    - **iPhone / iPad:** install the profile, then enable it under *Settings → General → About → Certificate Trust Settings*.
 2. **Open `https://<pc-ip>:8443/`** in Chrome, then tap *⋮ → Install app*.
 
-The app creates its own small certificate authority for your network. The certificate is renewed automatically when your PC's IP changes, so each phone is set up only once. That authority is restricted to private network addresses and `.local` names, so it can't be misused for real websites. Plain HTTP and the desktop window keep working as before.
+The app creates its own small certificate authority for your network, or reuses Dwarfium's if you point it at Dwarfium's certificate folder (then a phone that trusts Dwarfium already trusts this app). The certificate is renewed automatically when your PC's IP changes, so each phone is set up only once. That authority is restricted to private network addresses and `.local` names, so it can't be misused for real websites. Plain HTTP and the desktop window keep working as before.
 
-- **Files:** stored in `~/.smartscope_session/https/`. Change with `SMARTSCOPE_CERT_DIR`, and the port with `SMARTSCOPE_HTTPS_PORT`.
+- **Files:** stored in `~/.astro_dwarf_session/https/` (in Docker: `/data/https`). Change with `ASTRO_DWARF_CERT_DIR`, and the port with `ASTRO_DWARF_HTTPS_PORT`.
 - **Firewall:** allow TCP 8443 if your PC runs one.
 
 ---
@@ -230,7 +230,6 @@ smartscopes/
 ├── catalogue.py     the app's own catalogue (data/catalogue.json), TonightPlan's ratings laid over it
 ├── plan_targets.py  per-scope adapters for the TonightPlan dialog (drivers, Dwarfs)
 ├── nightplan.py     shares the ticked targets between telescopes: framing, imaging time, slots
-├── https.py         private CA + auto-renewed server certificate + TLS relay (port 8443)
 ├── branding.py      "Smartscope Session" name applied at startup
 ├── ui/              dashboard section, /scopes/... pages, TonightPlan dialogs, HTTPS setup
 └── tests/           fake Seestar TCP server + protocol, runner and planner tests

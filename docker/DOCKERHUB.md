@@ -42,7 +42,7 @@ Then open `http://<server-ip>:8765`.
 |---|---|---|
 | `TZ` | `Europe/Copenhagen` | **Set this to your time zone.** Programs start by local clock time. |
 | `PORT` | `8765` | Web UI port. Change it if something else already uses it. |
-| `SMARTSCOPE_HTTPS_PORT` | `8443` | HTTPS for phones (optional, enabled from the app). |
+| `ASTRO_DWARF_HTTPS_PORT` | `8443` | HTTPS for phones (optional, enabled from the app). |
 | `/data` volume | | Everything the app stores: telescopes, Sites, program queues, logs, HTTPS certificates. Back it up. |
 
 **Why host networking:** the app needs your server's real LAN address, for the Watch-mode QR code and the phone HTTPS certificate. It also talks to the telescopes directly on your network.

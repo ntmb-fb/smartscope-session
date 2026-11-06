@@ -28,7 +28,7 @@ VOLUME /data
 ENV PYTHONUNBUFFERED=1 \
     TZ=Europe/Copenhagen \
     PORT=8765 \
-    SMARTSCOPE_CERT_DIR=/data/https
+    ASTRO_DWARF_CERT_DIR=/data/https
 
 EXPOSE 8765 8443
 CMD ["sh", "-c", "exec python /app/astro_dwarf_ui.py --no_native --host 0.0.0.0 --port ${PORT}"]
