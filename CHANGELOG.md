@@ -1,5 +1,24 @@
 # Changelog
 
+## [3.2.7] - 2026-11-07
+
+  ### Add
+    Sessions ended while the app was stopped are now verified more reliably. When the app was closed or the PC froze during a capture, a session that finished on the Dwarf could still be filed as failed if fewer images were taken than planned. The app now also checks that the Dwarf saved its final stacked file (a .fits for a single target, a .zip for a mosaic) and that it is complete. If it is, the session is filed as completed, with the actual count shown (for example “ended at 504/540”). If the file is missing or truncated, it is still filed as an error.
+
+  ### BugFix
+    Full-screen live view now works for mosaics
+    Previously, no image was shown during a mosaic capture. The view now looks up which panel is currently being shot and displays that panel's latest stacked image. It also refreshes only when a new image has actually been stacked, not on every photo taken, so you see the result of the stacking rather than a raw frame.
+
+    Total imaging time in the album is now accurate
+    The duration shown for a session was calculated from every frame taken, including those rejected during stacking. It now counts only the stacked frames, so it reflects the real integration time. For example, 130 stacked frames of 45 s now show 1 h 37 min instead of 2 h 16 min.
+
+    Completed mosaics are no longer filed as failed after a restart
+    When the app was restarted or disconnected during a mosaic and then resumed following the capture, the Dwarf finished all 220 images but the program was still moved to "Error". The app was comparing the target against the current panel's count instead of the mosaic's total. It now uses the total, so a finished mosaic correctly goes to "Done". The same fix applies when the app reconnects after a network drop.
+
+    Program files no longer show outdated mosaic and image-count info
+    Resumed or re-run programs could keep the "mosaic" flag and image count from an earlier run, which led to wrong details on the Results cards. These values are now cleared when a run starts and recalculated when a capture is resumed or finalized.
+
+
 ## [3.2.6] - 2026-10-17
   ### Add
     ### Eclipsing binaries: your own elements for a star
