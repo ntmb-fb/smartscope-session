@@ -14,7 +14,7 @@ name: Purge green run logs
 
 on:
   workflow_run:
-    workflows: ["Build Astro Dwarf UI", "Docker image", "Sync upstream"]
+    workflows: ["Build Astro Dwarf UI", "Docker image", "Sync upstream", "Delete merged branches"]
     types: [completed]
   workflow_dispatch:
 
